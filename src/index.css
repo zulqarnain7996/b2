@@ -1,0 +1,111 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  :root {
+    --bg: 244 246 251;
+    --surface: 255 255 255;
+    --text: 15 23 42;
+    --muted: 100 116 139;
+    --border: 227 233 243;
+    --primary: 37 99 235;
+    --primary-foreground: 248 250 252;
+  }
+
+  .dark {
+    --bg: 11 18 32;
+    --surface: 17 26 47;
+    --text: 229 236 250;
+    --muted: 159 176 204;
+    --border: 35 50 80;
+    --primary: 59 130 246;
+    --primary-foreground: 248 250 252;
+  }
+
+  * {
+    border-color: rgb(var(--border));
+  }
+
+  html,
+  body,
+  #root {
+    @apply min-h-full;
+  }
+
+  body {
+    @apply antialiased;
+    color: rgb(var(--text));
+    background:
+      radial-gradient(circle at 6% 0%, rgba(37, 99, 235, 0.09), transparent 28%),
+      radial-gradient(circle at 90% 0%, rgba(14, 165, 233, 0.07), transparent 24%),
+      rgb(var(--bg));
+  }
+}
+
+@layer components {
+  .app-card {
+    @apply rounded-2xl border shadow-[0_6px_26px_rgba(15,23,42,0.06)] transition-all duration-200;
+    background: rgb(var(--surface));
+    border-color: rgb(var(--border));
+    color: rgb(var(--text));
+  }
+
+  .app-card-hover {
+    @apply hover:-translate-y-0.5 hover:shadow-[0_12px_28px_rgba(15,23,42,0.1)];
+  }
+
+  .app-toolbar {
+    @apply rounded-2xl border p-4 shadow-[0_4px_20px_rgba(15,23,42,0.04)];
+    background: rgb(var(--surface));
+    border-color: rgb(var(--border));
+    color: rgb(var(--text));
+  }
+
+  .ui-data-table thead th {
+    @apply px-3 py-2.5 text-left text-xs font-semibold uppercase tracking-wide;
+    background: color-mix(in srgb, rgb(var(--surface)) 90%, rgb(var(--text)));
+    color: rgb(var(--muted));
+  }
+
+  .ui-data-table tbody td {
+    @apply border-t px-3 py-2.5 text-sm;
+    border-top-color: color-mix(in srgb, rgb(var(--border)) 88%, transparent);
+    color: rgb(var(--text));
+  }
+
+  .ui-data-table-sticky thead th {
+    @apply sticky top-0 z-10;
+  }
+
+  .ui-data-table-zebra tbody tr:nth-child(even) {
+    background: color-mix(in srgb, rgb(var(--surface)) 92%, rgb(var(--text)));
+  }
+
+  .ui-data-table-hover tbody tr:hover {
+    background: color-mix(in srgb, rgb(var(--primary)) 10%, rgb(var(--surface)));
+  }
+
+  /* Compatibility layer for legacy hardcoded slate/white classes still used in pages. */
+  .bg-white {
+    background-color: rgb(var(--surface));
+  }
+
+  .text-slate-900,
+  .text-slate-800,
+  .text-slate-700 {
+    color: rgb(var(--text));
+  }
+
+  .text-slate-600,
+  .text-slate-500,
+  .text-slate-400 {
+    color: rgb(var(--muted));
+  }
+
+  .border-slate-200,
+  .border-slate-100,
+  .border-slate-300 {
+    border-color: rgb(var(--border));
+  }
+}

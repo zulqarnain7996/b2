@@ -1,0 +1,10 @@
+node_modules
+dist
+.vscode
+*.log
+backend/.venv
+backend/__pycache__
+backend/uploads/*
+!backend/uploads/.gitkeep
+.env
+backend/.env

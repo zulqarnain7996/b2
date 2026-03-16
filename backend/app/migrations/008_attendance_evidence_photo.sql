@@ -1,0 +1,2 @@
+ALTER TABLE attendance
+ADD COLUMN IF NOT EXISTS evidence_photo_url VARCHAR(500) NULL;
