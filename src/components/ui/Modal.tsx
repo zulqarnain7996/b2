@@ -51,12 +51,12 @@ export function Modal({ isOpen, title, onClose, children, footer, width = "lg" }
 
   return (
     <div
-      className="fixed inset-0 z-[100] grid place-items-center bg-slate-950/45 px-4 py-6 backdrop-blur-[2px]"
+      className="fixed inset-0 z-[100] grid place-items-center overflow-y-auto bg-slate-950/55 px-4 py-6 backdrop-blur-[6px]"
       onClick={() => onCloseRef.current()}
     >
       <div
         ref={cardRef}
-        className={`w-full rounded-2xl border border-[rgb(var(--border))] bg-[rgb(var(--surface))] text-[rgb(var(--text))] shadow-2xl transition duration-200 ${
+        className={`theme-surface my-auto flex max-h-[min(90vh,calc(100vh-3rem))] w-full flex-col overflow-hidden rounded-2xl border text-[rgb(var(--text))] transition duration-200 ${
           width === "md" ? "max-w-md" : "max-w-3xl"
         }`}
         onClick={(e) => e.stopPropagation()}
@@ -65,12 +65,19 @@ export function Modal({ isOpen, title, onClose, children, footer, width = "lg" }
         aria-labelledby={title ? titleId : undefined}
       >
         {title && (
-          <h3 id={titleId} className="border-b border-[rgb(var(--border))] px-5 py-4 text-lg font-semibold text-[rgb(var(--text))]">
+          <h3
+            id={titleId}
+            className="shrink-0 border-b border-[rgb(var(--border))] px-5 py-4 text-lg font-semibold text-[rgb(var(--text))]"
+          >
             {title}
           </h3>
         )}
-        <div className="px-5 py-4">{children}</div>
-        {footer && <div className="flex justify-end gap-2 border-t border-[rgb(var(--border))] px-5 py-4">{footer}</div>}
+        <div className="modal-scrollbar min-h-0 flex-1 overflow-y-auto px-5 py-4">{children}</div>
+        {footer && (
+          <div className="flex shrink-0 justify-end gap-2 border-t border-[rgb(var(--border))] px-5 py-4">
+            {footer}
+          </div>
+        )}
       </div>
     </div>
   );

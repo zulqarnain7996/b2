@@ -7,8 +7,8 @@ type TextareaProps = TextareaHTMLAttributes<HTMLTextAreaElement> & {
 
 export function Textarea({ label, className = "", ...props }: TextareaProps) {
   const textareaClass = cn(
-    "w-full rounded-xl border border-[rgb(var(--border))] bg-[rgb(var(--surface))] px-3 py-2.5 text-sm text-[rgb(var(--text))] shadow-sm outline-none transition",
-    "placeholder:text-[rgb(var(--muted))] focus:border-[rgb(var(--primary))] focus:ring-4 focus:ring-[rgb(var(--primary))]/20",
+    "w-full rounded-xl border border-[rgb(var(--border))] bg-[rgb(var(--surface-elevated))] px-3 py-2.5 text-sm text-[rgb(var(--text))] shadow-sm outline-none transition",
+    "placeholder:text-[rgb(var(--muted))] focus:border-[rgb(var(--primary))] focus:ring-4 focus:ring-[rgba(var(--focus-ring),0.18)]",
     "disabled:cursor-not-allowed disabled:opacity-50",
     className,
   );

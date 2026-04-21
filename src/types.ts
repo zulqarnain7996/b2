@@ -1,3 +1,17 @@
+export type PermissionKey =
+  | "can_view_all_attendance"
+  | "can_view_monthly_attendance"
+  | "can_manage_notices"
+  | "can_view_audit_logs"
+  | "can_manage_employees"
+  | "can_manage_users"
+  | "can_backup_restore";
+
+export type PermissionAssignment = {
+  key: PermissionKey;
+  allowed_departments: string[];
+};
+
 export type Employee = {
   id: string;
   name: string;
@@ -6,10 +20,29 @@ export type Employee = {
   role: string;
   shiftStartTime?: string | null;
   gracePeriodMins?: number | null;
-  finePerMinutePkr?: number | null;
+  lateFinePkr?: number | null;
+  absentFinePkr?: number | null;
+  notMarkedFinePkr?: number | null;
+  offDays?: string[];
   isActive: boolean;
   photoUrl?: string;
   createdAt?: string;
+  updatedAt?: string;
+  userId?: number | null;
+  userRole?: string | null;
+  userCreatedAt?: string | null;
+  forcePasswordChange?: boolean;
+  faceEmbeddingsCount?: number;
+};
+
+export type Department = {
+  id: number;
+  name: string;
+  is_active: boolean;
+  employee_count: number;
+  notice_count: number;
+  created_at?: string | null;
+  updated_at?: string | null;
 };
 
 export type AuthUser = {
@@ -18,6 +51,10 @@ export type AuthUser = {
   email: string;
   role: "admin" | "user";
   employeeId?: string | null;
+  department?: string | null;
+  permissions?: PermissionAssignment[];
+  photoUrl?: string | null;
+  forcePasswordChange?: boolean;
   createdAt?: string | null;
 };
 
@@ -27,6 +64,8 @@ export type SystemUser = {
   email: string;
   role: "admin" | "user";
   employeeId?: string | null;
+  department?: string | null;
+  permissions?: PermissionAssignment[];
   createdAt?: string | null;
 };
 
@@ -44,6 +83,8 @@ export type AttendanceRecord = {
   source?: "face" | "manual" | null;
   note?: string | null;
   evidencePhotoUrl?: string | null;
+  deviceInfo?: string | null;
+  deviceIp?: string | null;
   fineAmount: number;
   confidence: number;
   createdAt?: string;
@@ -57,7 +98,7 @@ export type MyHistoryResponse = {
 
 export type MonthlyAttendanceDay = {
   date: string;
-  status: "Present" | "Late";
+  status: "Present" | "Late" | "Absent" | "Not Marked" | "Off" | "Pre-Join";
   checkInTime: string | null;
   lateMinutes?: number;
   source: "face" | "manual" | null;
@@ -69,7 +110,7 @@ export type MonthlyAttendanceDay = {
 export type MonthlyAttendanceCalendarDay = {
   date: string;
   weekday: string;
-  status: "present" | "absent" | "not_marked";
+  status: "present" | "absent" | "not_marked" | "off" | "pre_join";
   checkin_time: string | null;
   late_minutes?: number;
   fine_amount: number;
@@ -86,12 +127,27 @@ export type AuditLog = {
 };
 
 export type NoticePriority = "normal" | "important" | "urgent";
+export type NoticeAudience = "all" | "admins_only" | "users_only";
 
 export type Notice = {
   id: number;
   title: string;
   body: string;
   priority: NoticePriority;
+  is_active?: boolean;
+  is_sticky?: boolean;
+  show_on_login?: boolean;
+  show_on_refresh?: boolean;
+  repeat_every_login?: boolean;
+  is_dismissible?: boolean;
+  requires_acknowledgement?: boolean;
+  target_audience?: NoticeAudience;
+  target_department?: string | null;
+  target_role?: string | null;
+  created_by_user_id?: number | null;
+  created_by_name?: string | null;
+  closed_at?: string | null;
+  closed_by_user_id?: number | null;
   created_at: string | null;
   starts_at: string | null;
   ends_at: string | null;
@@ -99,8 +155,20 @@ export type Notice = {
 
 export type AdminNotice = Notice & {
   is_active: boolean;
+  is_sticky: boolean;
+  show_on_login: boolean;
+  show_on_refresh: boolean;
+  repeat_every_login: boolean;
+  is_dismissible: boolean;
+  requires_acknowledgement: boolean;
+  target_audience: NoticeAudience;
+  target_department: string | null;
+  target_role: string | null;
   updated_at: string | null;
   created_by_user_id?: number | null;
+  created_by_name?: string | null;
+  closed_at?: string | null;
+  closed_by_user_id?: number | null;
 };
 
 export type AdminAttendanceItem = {
@@ -162,6 +230,30 @@ export type AdminAttendanceEmployeeReport = {
 export type AppSettings = {
   shift_start_time: string;
   grace_period_mins: number;
-  fine_per_minute_pkr: number;
+  late_fine_pkr: number;
+  absent_fine_pkr: number;
+  not_marked_fine_pkr: number;
   updated_at: string | null;
+};
+
+export type AdminEmployeeDetail = {
+  ok: boolean;
+  employee: Employee;
+  attendanceSummary: {
+    totalRecords: number;
+    presentDays: number;
+    lateDays: number;
+    totalFine: number;
+    lastCheckin: string | null;
+  };
+  recentAttendance: Array<{
+    id: string;
+    date: string;
+    checkInTime: string | null;
+    status: string;
+    fineAmount: number;
+    confidence: number;
+    source: "face" | "manual" | null;
+    createdAt: string | null;
+  }>;
 };

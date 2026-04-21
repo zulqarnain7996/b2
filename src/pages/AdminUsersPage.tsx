@@ -14,7 +14,50 @@ import { Spinner } from "@/components/ui/Spinner";
 import { Table } from "@/components/ui/Table";
 import { apiClient } from "@/services/apiClient";
 import { useDebouncedValue } from "@/hooks/useDebouncedValue";
-import type { Employee, SystemUser } from "@/types";
+import { useDepartments } from "@/hooks/useDepartments";
+import type { Employee, PermissionAssignment, PermissionKey, SystemUser } from "@/types";
+
+const USER_PERMISSION_OPTIONS: Array<{ key: PermissionKey; label: string; description: string; scoped?: boolean }> = [
+  {
+    key: "can_view_all_attendance",
+    label: "All Attendance",
+    description: "Allows department-scoped access to the All Attendance page.",
+    scoped: true,
+  },
+  {
+    key: "can_view_monthly_attendance",
+    label: "Monthly Attendance",
+    description: "Allows department-scoped access to monthly attendance employee views.",
+    scoped: true,
+  },
+  {
+    key: "can_manage_notices",
+    label: "Manage Notices",
+    description: "Allows access to the notices management page.",
+  },
+  {
+    key: "can_view_audit_logs",
+    label: "Audit Logs",
+    description: "Allows access to audit logs.",
+  },
+  {
+    key: "can_manage_employees",
+    label: "Manage Employees",
+    description: "Allows access to employee management.",
+  },
+  {
+    key: "can_manage_users",
+    label: "Manage Users",
+    description: "Allows access to user management.",
+  },
+  {
+    key: "can_backup_restore",
+    label: "Backup & Restore",
+    description: "Allows access to backup and restore tools.",
+  },
+];
+
+const PERMISSION_LABELS = new Map(USER_PERMISSION_OPTIONS.map((option) => [option.key, option.label]));
 
 function fmtDate(value?: string | null) {
   if (!value) return "-";
@@ -23,9 +66,14 @@ function fmtDate(value?: string | null) {
   return date.toLocaleString();
 }
 
+function formatOffDays(days?: string[] | null) {
+  return days && days.length ? days.map((day) => day[0].toUpperCase() + day.slice(1)).join(", ") : "Not Set";
+}
+
 export function AdminUsersPage() {
   const { user: currentUser } = useAuth();
   const toast = useToast();
+  const { departments: departmentRecords } = useDepartments({ admin: true, includeInactive: true });
 
   const [users, setUsers] = useState<SystemUser[]>([]);
   const [employees, setEmployees] = useState<Employee[]>([]);
@@ -44,6 +92,7 @@ export function AdminUsersPage() {
     email: "",
     role: "user" as "admin" | "user",
     employeeId: "",
+    permissions: [] as PermissionAssignment[],
     resetPassword: false,
     newPassword: "",
   });
@@ -88,6 +137,11 @@ export function AdminUsersPage() {
     () => filteredUsers.slice((page - 1) * pageSize, page * pageSize),
     [filteredUsers, page],
   );
+  const employeeById = useMemo(() => new Map(employees.map((employee) => [employee.id, employee])), [employees]);
+  const departmentOptions = useMemo(
+    () => departmentRecords.map((department) => department.name).sort((a, b) => a.localeCompare(b)),
+    [departmentRecords],
+  );
 
   useEffect(() => {
     if (page > totalPages) setPage(totalPages);
@@ -119,6 +173,54 @@ export function AdminUsersPage() {
     });
     return map;
   }, [users]);
+
+  function getPermissionAssignment(permissionKey: PermissionKey) {
+    return editForm.permissions.find((permission) => permission.key === permissionKey) || null;
+  }
+
+  function setPermissionEnabled(permissionKey: PermissionKey, enabled: boolean) {
+    setEditForm((prev) => {
+      const existing = prev.permissions.find((permission) => permission.key === permissionKey) || null;
+      return {
+        ...prev,
+        permissions: enabled
+          ? [
+              ...prev.permissions.filter((permission) => permission.key !== permissionKey),
+              existing || { key: permissionKey, allowed_departments: [] },
+            ]
+          : prev.permissions.filter((permission) => permission.key !== permissionKey),
+      };
+    });
+  }
+
+  function togglePermissionDepartment(permissionKey: PermissionKey, departmentName: string, checked: boolean) {
+    setEditForm((prev) => ({
+      ...prev,
+      permissions: prev.permissions.map((permission) => {
+        if (permission.key !== permissionKey) return permission;
+        const nextDepartments = checked
+          ? [...permission.allowed_departments, departmentName]
+          : permission.allowed_departments.filter((value) => value !== departmentName);
+        return {
+          ...permission,
+          allowed_departments: Array.from(new Set(nextDepartments)),
+        };
+      }),
+    }));
+  }
+
+  function formatPermissionSummary(assignments?: PermissionAssignment[]) {
+    if (!assignments?.length) return "-";
+    return assignments
+      .map((assignment) => {
+        const label = PERMISSION_LABELS.get(assignment.key) || assignment.key;
+        const scopedDepartments = assignment.allowed_departments?.length
+          ? ` (${assignment.allowed_departments.join(", ")})`
+          : "";
+        return `${label}${scopedDepartments}`;
+      })
+      .join(", ");
+  }
 
   function toggleSelectAllVisible() {
     if (allVisibleSelected) {
@@ -162,12 +264,23 @@ export function AdminUsersPage() {
   }
 
   function openEdit(user: SystemUser) {
+    const nextPermissions = Array.isArray(user.permissions)
+      ? user.permissions.map((permission) => ({
+          key: permission.key,
+          allowed_departments: Array.isArray(permission.allowed_departments) ? [...permission.allowed_departments] : [],
+        }))
+      : [];
+    if (import.meta.env.DEV) {
+      console.debug("[AdminUsersPage.openEdit] raw fetched user.permissions", user.permissions || []);
+      console.debug("[AdminUsersPage.openEdit] transformed edit form permissions", nextPermissions);
+    }
     setEditUserId(user.id);
     setEditForm({
       name: user.name,
       email: user.email,
       role: user.role,
       employeeId: user.employeeId ? String(user.employeeId) : "",
+      permissions: nextPermissions,
       resetPassword: false,
       newPassword: "",
     });
@@ -176,14 +289,22 @@ export function AdminUsersPage() {
   async function saveEdit() {
     if (!editUserId) return;
     setBusy(true);
-    try {
-      await apiClient.updateUser(editUserId, {
-        name: editForm.name.trim(),
-        email: editForm.email.trim(),
-        role: editForm.role,
-        employee_id: editForm.employeeId ? Number(editForm.employeeId) : null,
-        password: editForm.resetPassword ? editForm.newPassword : undefined,
+    const payload = {
+      name: editForm.name.trim(),
+      email: editForm.email.trim(),
+      role: editForm.role,
+      employee_id: editForm.employeeId ? Number(editForm.employeeId) : null,
+      permissions: editForm.permissions,
+      password: editForm.resetPassword ? editForm.newPassword : undefined,
+    };
+    if (import.meta.env.DEV) {
+      console.debug("[AdminUsersPage.saveEdit] outgoing PUT payload", {
+        userId: editUserId,
+        ...payload,
       });
+    }
+    try {
+      await apiClient.updateUser(editUserId, payload);
       toast.success("User updated successfully.");
       setEditUserId(null);
       await loadUsers();
@@ -278,6 +399,9 @@ export function AdminUsersPage() {
                   <th>Email</th>
                   <th>Role</th>
                   <th>Employee ID</th>
+                  <th>Department</th>
+                  <th>Permissions</th>
+                  <th>Off Days</th>
                   <th>Created At</th>
                   <th>Actions</th>
                 </tr>
@@ -285,6 +409,7 @@ export function AdminUsersPage() {
               <tbody>
                 {pagedUsers.map((u) => {
                   const isMe = u.id === myUserId;
+                  const linkedEmployee = u.employeeId ? employeeById.get(u.employeeId) : undefined;
                   return (
                     <tr key={u.id}>
                       <td>
@@ -306,9 +431,14 @@ export function AdminUsersPage() {
                       <td>{u.email}</td>
                       <td>
                         <Badge variant={u.role === "admin" ? "admin" : "user"}>{u.role}</Badge>
-                      </td>
-                      <td>{u.employeeId || "-"}</td>
-                      <td>{fmtDate(u.createdAt)}</td>
+                        </td>
+                        <td>{u.employeeId || "-"}</td>
+                        <td>{u.department || "-"}</td>
+                        <td className="text-sm text-slate-600">
+                          {u.role === "admin" ? "Full admin" : formatPermissionSummary(u.permissions)}
+                        </td>
+                        <td className="text-sm text-slate-600">{formatOffDays(linkedEmployee?.offDays)}</td>
+                        <td>{fmtDate(u.createdAt)}</td>
                       <td>
                         <div className="flex items-center gap-2">
                           <Button
@@ -407,6 +537,78 @@ export function AdminUsersPage() {
               );
             })}
           </Select>
+        </div>
+        <div className="mt-4 rounded-2xl border border-[rgb(var(--border))] bg-[rgb(var(--surface))] p-4">
+          <p className="text-sm font-semibold text-[rgb(var(--text))]">Feature Permissions</p>
+          <p className="mt-1 text-xs text-[rgb(var(--muted))]">
+            Admin users always have global access. Scoped permissions can be limited to one or more departments.
+          </p>
+          <div className="mt-3 grid gap-3 md:grid-cols-2">
+            {USER_PERMISSION_OPTIONS.map((permission) => {
+              const assignment = getPermissionAssignment(permission.key);
+              const checked = !!assignment;
+              const disabled = editForm.role === "admin";
+              return (
+                <div
+                  key={permission.key}
+                  className="rounded-2xl border border-[rgb(var(--border))] bg-[rgb(var(--surface-elevated))] p-3"
+                >
+                  <div className="flex items-start gap-3">
+                    <input
+                      type="checkbox"
+                      checked={disabled ? true : checked}
+                      disabled={disabled}
+                      onChange={(event) => setPermissionEnabled(permission.key, event.target.checked)}
+                    />
+                    <div>
+                      <p className="text-sm font-medium text-[rgb(var(--text))]">{permission.label}</p>
+                      <p className="mt-1 text-xs text-[rgb(var(--muted))]">{permission.description}</p>
+                      {permission.scoped && checked && editForm.role !== "admin" ? (
+                        <div className="mt-3 space-y-2">
+                          <p className="text-[11px] font-semibold uppercase tracking-[0.14em] text-[rgb(var(--muted))]">
+                            Allowed Departments
+                          </p>
+                          <div className="flex flex-wrap gap-2">
+                            {departmentOptions.map((departmentName) => {
+                              const departmentChecked = !!assignment?.allowed_departments?.includes(departmentName);
+                              return (
+                                <label
+                                  key={departmentName}
+                                  className={`inline-flex items-center gap-2 rounded-full border px-3 py-1.5 text-xs ${
+                                    departmentChecked
+                                      ? "border-sky-300/60 bg-sky-500/12 text-sky-700 dark:text-sky-200"
+                                      : "border-[rgb(var(--border))] bg-[rgb(var(--surface))] text-[rgb(var(--text-soft))]"
+                                  }`}
+                                >
+                                  <input
+                                    type="checkbox"
+                                    className="hidden"
+                                    checked={departmentChecked}
+                                    onChange={(event) =>
+                                      togglePermissionDepartment(permission.key, departmentName, event.target.checked)
+                                    }
+                                  />
+                                  <span>{departmentName}</span>
+                                </label>
+                              );
+                            })}
+                          </div>
+                          <p className="text-[11px] text-[rgb(var(--muted))]">
+                            Leave this empty to fall back to the linked employee department.
+                          </p>
+                        </div>
+                      ) : null}
+                    </div>
+                  </div>
+                </div>
+              );
+            })}
+          </div>
+          {editForm.role !== "admin" && !editForm.employeeId ? (
+            <p className="mt-3 text-xs text-amber-600">
+              Link this user to an employee so department-scoped permissions can be enforced safely.
+            </p>
+          ) : null}
         </div>
         <div className="mt-4 rounded-2xl border border-[rgb(var(--border))] bg-[rgb(var(--surface))] p-4">
           <label className="flex items-center gap-2">

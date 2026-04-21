@@ -1,4 +1,5 @@
 import { FormEvent, useState } from "react";
+import { useAuth } from "@/auth/AuthContext";
 import { useToast } from "@/components/feedback/ToastProvider";
 import { Alert } from "@/components/ui/Alert";
 import { Button } from "@/components/ui/Button";
@@ -8,6 +9,7 @@ import { PageHeader } from "@/components/ui/PageHeader";
 import { apiClient } from "@/services/apiClient";
 
 export function ChangePasswordPage() {
+  const { user, refreshMe } = useAuth();
   const toast = useToast();
   const [currentPassword, setCurrentPassword] = useState("");
   const [newPassword, setNewPassword] = useState("");
@@ -31,6 +33,7 @@ export function ChangePasswordPage() {
     setSaving(true);
     try {
       await apiClient.changePassword({ oldPassword: currentPassword, newPassword });
+      await refreshMe();
       setCurrentPassword("");
       setNewPassword("");
       setConfirmPassword("");
@@ -50,6 +53,9 @@ export function ChangePasswordPage() {
 
       <Card>
       <form onSubmit={onSubmit} className="grid gap-3">
+        {user?.forcePasswordChange ? (
+          <Alert variant="info">Your account requires a password update before you continue using the workspace.</Alert>
+        ) : null}
         <Input
           label="Current Password"
           type="password"

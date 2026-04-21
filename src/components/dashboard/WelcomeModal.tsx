@@ -16,7 +16,7 @@ export function WelcomeModal({ isOpen, name, role, onClose, onQuickTour }: Welco
       isOpen={isOpen}
       onClose={onClose}
       width="md"
-      title="Welcome to IVS VisionTrack Pro"
+      title="Welcome to IVS AttendPro"
       footer={
         <>
           {onQuickTour ? (

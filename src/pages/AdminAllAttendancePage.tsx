@@ -1,8 +1,11 @@
 import { useEffect, useMemo, useState } from "react";
 import { Download, Search, Users, ShieldCheck, Clock3, Wallet } from "lucide-react";
 import { useSearchParams } from "react-router-dom";
+import { useAuth } from "@/auth/AuthContext";
 import { useDebouncedValue } from "@/hooks/useDebouncedValue";
+import { useDepartments } from "@/hooks/useDepartments";
 import { AttendanceDetailsDrawer } from "@/components/attendance/AttendanceDetailsDrawer";
+import { AttendanceEditModal } from "@/components/attendance/AttendanceEditModal";
 import { Avatar } from "@/components/Avatar";
 import { useToast } from "@/components/feedback/ToastProvider";
 import { Alert } from "@/components/ui/Alert";
@@ -78,8 +81,17 @@ function SummaryCard({
 }
 
 export function AdminAllAttendancePage() {
+  const { isAdmin, getAllowedDepartments } = useAuth();
   const toast = useToast();
   const [searchParams] = useSearchParams();
+  const allowedDepartments = useMemo(
+    () => getAllowedDepartments("can_view_all_attendance"),
+    [getAllowedDepartments],
+  );
+  const { departments: departmentRecords } = useDepartments({
+    admin: isAdmin,
+    includeInactive: isAdmin,
+  });
   const [items, setItems] = useState<AdminAttendanceItem[]>([]);
   const [total, setTotal] = useState(0);
   const [page, setPage] = useState(1);
@@ -94,16 +106,31 @@ export function AdminAllAttendancePage() {
   const [statusFilter, setStatusFilter] = useState<StatusFilter>("all");
   const [sortByFineDesc, setSortByFineDesc] = useState(false);
   const [search, setSearch] = useState("");
-  const [departments, setDepartments] = useState<string[]>([]);
   const [selectedRow, setSelectedRow] = useState<AdminAttendanceItem | null>(null);
   const [drawerOpen, setDrawerOpen] = useState(false);
+  const [editingRow, setEditingRow] = useState<AdminAttendanceItem | null>(null);
+  const [editSaving, setEditSaving] = useState(false);
+  const [editError, setEditError] = useState("");
   const debouncedSearch = useDebouncedValue(search, 300);
 
   const totalPages = Math.max(1, Math.ceil(total / limit));
+  const departments = useMemo(() => {
+    const base = departmentRecords.map((departmentRecord) => departmentRecord.name);
+    if (isAdmin) return base;
+    const allowed = new Set(allowedDepartments || []);
+    return base.filter((departmentName) => allowed.has(departmentName));
+  }, [allowedDepartments, departmentRecords, isAdmin]);
+  const scopedDepartment = !isAdmin && allowedDepartments?.length === 1 ? allowedDepartments[0] : "";
 
   useEffect(() => {
     if (page > totalPages) setPage(totalPages);
   }, [page, totalPages]);
+
+  useEffect(() => {
+    if (scopedDepartment && department !== scopedDepartment) {
+      setDepartment(scopedDepartment);
+    }
+  }, [department, scopedDepartment]);
 
   useEffect(() => {
     setPage(1);
@@ -145,16 +172,6 @@ export function AdminAllAttendancePage() {
     };
   }, [filteredRows, selectedRow]);
 
-  async function loadDepartments() {
-    try {
-      const res = await apiClient.getEmployees();
-      const uniq = Array.from(new Set(res.employees.map((e) => e.department).filter(Boolean))).sort();
-      setDepartments(uniq);
-    } catch {
-      // non-blocking
-    }
-  }
-
   async function loadAttendance() {
     setLoading(true);
     setError("");
@@ -179,10 +196,6 @@ export function AdminAllAttendancePage() {
       setLoading(false);
     }
   }
-
-  useEffect(() => {
-    void loadDepartments();
-  }, []);
 
   useEffect(() => {
     void loadAttendance();
@@ -225,7 +238,7 @@ export function AdminAllAttendancePage() {
   function resetFilters() {
     setFromDate("");
     setToDate("");
-    setDepartment("");
+    setDepartment(scopedDepartment || "");
     setSourceFilter("all");
     setLateFilter("all");
     setStatusFilter("all");
@@ -287,6 +300,36 @@ export function AdminAllAttendancePage() {
     setDrawerOpen(true);
   }
 
+  function openEditModal(row: AdminAttendanceItem) {
+    setEditError("");
+    setEditingRow(row);
+  }
+
+  async function saveAttendanceEdit(payload: {
+    status: "Present" | "Late" | "Absent";
+    checkin_time: string | null;
+    source: "face" | "manual";
+    note: string;
+  }) {
+    if (!editingRow) return;
+    setEditSaving(true);
+    setEditError("");
+    try {
+      await apiClient.updateAdminAttendance(editingRow.id, payload);
+      setEditingRow(null);
+      setDrawerOpen(false);
+      setSelectedRow(null);
+      await loadAttendance();
+      toast.success("Attendance updated successfully.");
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : "Failed to update attendance";
+      setEditError(msg);
+      toast.error(msg);
+    } finally {
+      setEditSaving(false);
+    }
+  }
+
   return (
     <div className="mx-auto w-full max-w-7xl space-y-5">
       <PageHeader title="All Attendance" subtitle="Clean, filterable attendance view for admins." />
@@ -315,8 +358,8 @@ export function AdminAllAttendancePage() {
           <div className="grid gap-3 md:grid-cols-7">
             <Input type="date" value={fromDate} onChange={(e) => setFromDate(e.target.value)} />
             <Input type="date" value={toDate} onChange={(e) => setToDate(e.target.value)} />
-            <Select value={department} onChange={(e) => setDepartment(e.target.value)}>
-              <option value="">All departments</option>
+            <Select value={department} onChange={(e) => setDepartment(e.target.value)} disabled={!isAdmin && !!scopedDepartment}>
+              {isAdmin || !scopedDepartment ? <option value="">All departments</option> : null}
               {departments.map((d) => (
                 <option key={d} value={d}>{d}</option>
               ))}
@@ -367,16 +410,13 @@ export function AdminAllAttendancePage() {
                   <th>Status</th>
                   <th>Late</th>
                   <th>Fine (PKR)</th>
-                  <th>Source</th>
                   <th>Evidence</th>
-                  <th>Confidence</th>
                   <th>Action</th>
                 </tr>
               </thead>
               <tbody>
                 {filteredRows.map((row) => {
                   const late = Number(row.fine_amount || 0) > 0;
-                  const confidencePct = Number(row.confidence || 0) * 100;
                   return (
                     <tr key={row.id}>
                       <td><Avatar name={row.employee.name} src={row.employee.photo_url || ""} /></td>
@@ -389,7 +429,6 @@ export function AdminAllAttendancePage() {
                       <td><Badge variant={String(row.status || "").toLowerCase() === "present" ? "success" : "warn"}>{row.status}</Badge></td>
                       <td>{late ? <Badge variant="warn">{Number(row.late_minutes ?? 0)} min</Badge> : <span className="text-xs text-[rgb(var(--muted))]">On time</span>}</td>
                       <td>{Number(row.fine_amount || 0).toFixed(2)}</td>
-                      <td><Badge variant={row.source === "manual" ? "important" : "normal"}>{row.source || "-"}</Badge></td>
                       <td>
                         {row.evidence_photo_url ? (
                           <img
@@ -401,13 +440,17 @@ export function AdminAllAttendancePage() {
                           <span className="text-xs text-[rgb(var(--muted))]">No image</span>
                         )}
                       </td>
-                      <td className={confidencePct >= 85 ? "text-emerald-600" : confidencePct >= 65 ? "text-amber-600" : "text-rose-600"}>
-                        {confidencePct.toFixed(1)}%
-                      </td>
                       <td>
-                        <Button size="sm" variant="secondary" onClick={() => openDrawer(row)}>
-                          View
-                        </Button>
+                        <div className="flex items-center gap-2">
+                          <Button size="sm" variant="secondary" onClick={() => openDrawer(row)}>
+                            View
+                          </Button>
+                          {isAdmin ? (
+                            <Button size="sm" onClick={() => openEditModal(row)}>
+                              Edit
+                            </Button>
+                          ) : null}
+                        </div>
                       </td>
                     </tr>
                   );
@@ -431,6 +474,20 @@ export function AdminAllAttendancePage() {
         onClose={() => setDrawerOpen(false)}
         quickStats={selectedEmployeeStats}
       />
+      {isAdmin ? (
+        <AttendanceEditModal
+          isOpen={!!editingRow}
+          row={editingRow}
+          saving={editSaving}
+          error={editError}
+          onClose={() => {
+            if (editSaving) return;
+            setEditingRow(null);
+            setEditError("");
+          }}
+          onSave={saveAttendanceEdit}
+        />
+      ) : null}
     </div>
   );
 }

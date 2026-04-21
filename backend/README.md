@@ -32,11 +32,23 @@ This executes `app/schema.sql` and creates all required tables.
 
 ```bash
 cd backend
-uvicorn app.main:app --reload --port 8000
+uvicorn app.main:app --host 0.0.0.0 --reload --port 8000
 ```
 
 - API base: `http://localhost:8000/api`
 - Uploads: `http://localhost:8000/uploads/<filename>`
+
+## LAN setup note
+
+For LAN browser access with webcam support, do not call this backend directly from the browser over `http://<LAN-IP>:8000`.
+
+Instead:
+
+1. Run the backend on the main PC as above.
+2. Run the Vite frontend on HTTPS.
+3. Let Vite proxy `/api` and `/uploads` to this backend.
+
+That keeps the browser on one HTTPS origin, which is required for camera access on other PCs without Chrome insecure-origin flags.
 
 ## Endpoints
 

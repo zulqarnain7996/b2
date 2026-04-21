@@ -13,7 +13,18 @@ import {
 } from "chart.js";
 import { Doughnut, Line } from "react-chartjs-2";
 import { motion } from "framer-motion";
-import { Activity, Bell, Building2, ChevronRight, Clock3, ShieldCheck, TrendingUp, UserX, Users, Wallet } from "lucide-react";
+import {
+  Activity,
+  Bell,
+  Building2,
+  ChevronRight,
+  Clock3,
+  ShieldCheck,
+  TrendingUp,
+  UserX,
+  Users,
+  Wallet,
+} from "lucide-react";
 import { useNavigate } from "react-router-dom";
 import { useAuth } from "@/auth/AuthContext";
 import { WelcomeModal } from "@/components/dashboard/WelcomeModal";
@@ -22,6 +33,7 @@ import { Button } from "@/components/ui/Button";
 import { Card } from "@/components/ui/Card";
 import { Modal } from "@/components/ui/Modal";
 import { TableSkeleton } from "@/components/ui/TableSkeleton";
+import { useTheme } from "@/theme/ThemeContext";
 import { apiClient } from "@/services/apiClient";
 import type { AttendanceRecord, AuditLog, Employee, Notice } from "@/types";
 
@@ -68,39 +80,40 @@ function routeWithQuery(path: string, params: Record<string, string>) {
   return qs ? `${path}?${qs}` : path;
 }
 
-function ClickableStatCard(props: {
+function DashboardStatCard(props: {
   title: string;
   value: number | string;
   subtitle: string;
   icon: React.ReactNode;
-  gradient: string;
+  toneClass: string;
+  cardClass: string;
   onClick: () => void;
   pulse?: boolean;
 }) {
   return (
-    <motion.div whileHover={{ y: -4, scale: 1.01 }} transition={{ duration: 0.16 }}>
+    <motion.div whileHover={{ y: -2 }} transition={{ duration: 0.16 }}>
       <div
         role="button"
         tabIndex={0}
         onClick={props.onClick}
         onKeyDown={(event) => onCardKeyDown(event, props.onClick)}
         className={classNames(
-          "relative cursor-pointer overflow-hidden rounded-3xl border border-white/35 p-5 text-white shadow-md transition duration-200 hover:shadow-[0_18px_40px_-22px_rgba(2,132,199,0.58)] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-cyan-300",
-          props.gradient,
+          "theme-surface cursor-pointer rounded-3xl border p-5 transition-all duration-200 hover:shadow-[0_18px_36px_rgba(var(--shadow-color),0.18)] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-sky-300",
+          props.cardClass,
           props.pulse && "animate-pulse",
         )}
       >
-        <div className="pointer-events-none absolute -right-8 -top-8 h-36 w-36 rounded-full bg-white/15 blur-2xl" />
-        <div className="pointer-events-none absolute -bottom-10 -left-10 h-36 w-36 rounded-full bg-white/10 blur-2xl" />
-        <div className="relative flex items-start justify-between gap-3">
-          <div>
-            <p className="text-xs font-semibold uppercase tracking-[0.14em] text-white/80">{props.title}</p>
-            <p className="mt-2 text-3xl font-extrabold">{props.value}</p>
-            <p className="mt-2 text-sm text-white/85">{props.subtitle}</p>
+        <div className="flex items-start justify-between gap-4">
+          <div className="min-w-0">
+            <p className="text-[11px] font-semibold uppercase tracking-[0.14em] text-[rgb(var(--text-soft))]">{props.title}</p>
+            <p className="mt-3 text-3xl font-bold tracking-tight text-[rgb(var(--text))]">{props.value}</p>
+            <p className="mt-2 text-sm text-[rgb(var(--text-soft))]">{props.subtitle}</p>
           </div>
-          <div className="grid h-11 w-11 place-items-center rounded-2xl bg-white/15 ring-1 ring-white/25">{props.icon}</div>
+          <div className={classNames("grid h-11 w-11 place-items-center rounded-2xl border text-sm shadow-sm", props.toneClass)}>
+            {props.icon}
+          </div>
         </div>
-        <div className="mt-4 inline-flex items-center gap-1 text-sm font-semibold text-white/95">
+        <div className="mt-4 inline-flex items-center gap-1 text-sm font-medium text-[rgb(var(--text-soft))]">
           View details <ChevronRight className="h-4 w-4" />
         </div>
       </div>
@@ -108,7 +121,7 @@ function ClickableStatCard(props: {
   );
 }
 
-function ClickableChip(props: {
+function DashboardChip(props: {
   label: string;
   icon: React.ReactNode;
   className: string;
@@ -121,7 +134,7 @@ function ClickableChip(props: {
       title={props.tooltip}
       onClick={props.onClick}
       className={classNames(
-        "inline-flex items-center gap-2 rounded-2xl border px-4 py-2 text-sm font-semibold transition hover:-translate-y-0.5 hover:shadow-sm focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-cyan-300",
+        "inline-flex items-center gap-2 rounded-2xl border px-3.5 py-2 text-sm font-medium transition hover:-translate-y-0.5 hover:shadow-sm focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-sky-300",
         props.className,
         props.pulse && "animate-pulse",
       )}
@@ -138,7 +151,9 @@ const doughnutCenterTextPlugin: Plugin<"doughnut"> = {
     const { ctx, chartArea } = chart;
     if (!chartArea) return;
     const anyPlugins = chart.options.plugins as unknown as Record<string, any>;
-    const cfg = anyPlugins?.doughnutCenterText as { title?: string; value?: string; subtitle?: string } | undefined;
+    const cfg = anyPlugins?.doughnutCenterText as
+      | { title?: string; value?: string; subtitle?: string; titleColor?: string; valueColor?: string; subtitleColor?: string }
+      | undefined;
     if (!cfg?.value) return;
 
     const centerX = (chartArea.left + chartArea.right) / 2;
@@ -148,16 +163,16 @@ const doughnutCenterTextPlugin: Plugin<"doughnut"> = {
     ctx.textBaseline = "middle";
 
     if (cfg.title) {
-      ctx.fillStyle = "#64748b";
+      ctx.fillStyle = cfg.titleColor || "#64748b";
       ctx.font = "600 11px ui-sans-serif, system-ui, -apple-system";
       ctx.fillText(cfg.title, centerX, centerY - 18);
     }
-    ctx.fillStyle = "#0f172a";
+    ctx.fillStyle = cfg.valueColor || "#0f172a";
     ctx.font = "800 28px ui-sans-serif, system-ui, -apple-system";
     ctx.fillText(cfg.value, centerX, centerY + 2);
 
     if (cfg.subtitle) {
-      ctx.fillStyle = "#475569";
+      ctx.fillStyle = cfg.subtitleColor || "#475569";
       ctx.font = "600 11px ui-sans-serif, system-ui, -apple-system";
       ctx.fillText(cfg.subtitle, centerX, centerY + 22);
     }
@@ -171,6 +186,7 @@ export function AdminDashboardPage() {
   const navigate = useNavigate();
   const { user } = useAuth();
   const toast = useToast();
+  const { theme } = useTheme();
 
   const [employees, setEmployees] = useState<Employee[]>([]);
   const [attendance, setAttendance] = useState<AttendanceRecord[]>([]);
@@ -285,7 +301,9 @@ export function AdminDashboardPage() {
       const dept = e.department || "Unknown";
       const row = stats.get(dept) || { total: 0, present: 0 };
       row.total += 1;
-      if (attendance.some((a) => a.employeeId === e.id && String(a.status).toLowerCase() === "present")) row.present += 1;
+      if (attendance.some((a) => a.employeeId === e.id && String(a.status).toLowerCase() === "present")) {
+        row.present += 1;
+      }
       stats.set(dept, row);
     });
     return Array.from(stats.entries())
@@ -307,63 +325,113 @@ export function AdminDashboardPage() {
       .slice(0, 5);
   }, [attendance]);
 
-  const lineData = useMemo(() => ({
-    labels: weeklyAttendanceData.labels,
-    datasets: [
-      {
-        label: "Check-ins",
-        data: weeklyAttendanceData.values,
-        tension: 0.38,
-        borderWidth: 3,
-        pointRadius: 3,
-        pointHoverRadius: 6,
-        borderColor: "#0284c7",
-        backgroundColor: "rgba(2,132,199,0.20)",
-        fill: true,
+  const lineData = useMemo(
+    () => ({
+      labels: weeklyAttendanceData.labels,
+      datasets: [
+        {
+          label: "Check-ins",
+          data: weeklyAttendanceData.values,
+          tension: 0.38,
+          borderWidth: 3,
+          pointRadius: 2.5,
+          pointHoverRadius: 5,
+          borderColor: "#0f6cbd",
+          backgroundColor: "rgba(15,108,189,0.10)",
+          fill: true,
+        },
+      ],
+    }),
+    [weeklyAttendanceData],
+  );
+
+  const chartPalette = useMemo(
+    () =>
+      theme === "dark"
+        ? {
+            legend: "#cfd9ee",
+            ticks: "#9eabc4",
+            grid: "rgba(148,163,184,0.18)",
+            centerTitle: "#9eabc4",
+            centerValue: "#eef4ff",
+            centerSubtitle: "#cfd9ee",
+            doughnutBorder: "#1f2937",
+          }
+        : {
+            legend: "#475569",
+            ticks: "#64748b",
+            grid: "rgba(148,163,184,0.16)",
+            centerTitle: "#64748b",
+            centerValue: "#0f172a",
+            centerSubtitle: "#475569",
+            doughnutBorder: "#ffffff",
+          },
+    [theme],
+  );
+
+  const lineOptions = useMemo<ChartOptions<"line">>(
+    () => ({
+      responsive: true,
+      maintainAspectRatio: false,
+      plugins: {
+        legend: {
+          display: true,
+          position: "bottom",
+          labels: { usePointStyle: true, boxWidth: 10, color: chartPalette.legend, padding: 18 },
+        },
       },
-    ],
-  }), [weeklyAttendanceData]);
-
-  const lineOptions = useMemo<ChartOptions<"line">>(() => ({
-    responsive: true,
-    maintainAspectRatio: false,
-    plugins: {
-      legend: { display: true, position: "bottom", labels: { usePointStyle: true, boxWidth: 10, color: "#334155", padding: 18 } },
-    },
-    scales: {
-      x: { ticks: { color: "#64748b" }, grid: { display: false } },
-      y: { beginAtZero: true, ticks: { precision: 0, color: "#64748b" }, grid: { color: "rgba(148,163,184,0.22)" } },
-    },
-  }), []);
-
-  const doughnutData = useMemo(() => ({
-    labels: ["Present", "Late/Other", "Absent"],
-    datasets: [
-      {
-        data: [presentToday, lateToday, absentToday],
-        backgroundColor: ["#22c55e", "#f59e0b", "#ef4444"],
-        borderColor: ["#ffffff", "#ffffff", "#ffffff"],
-        borderWidth: 6,
-        spacing: 3,
-        borderRadius: 12,
-        hoverOffset: 8,
+      scales: {
+        x: { ticks: { color: chartPalette.ticks }, grid: { display: false } },
+        y: {
+          beginAtZero: true,
+          ticks: { precision: 0, color: chartPalette.ticks },
+          grid: { color: chartPalette.grid },
+        },
       },
-    ],
-  }), [presentToday, lateToday, absentToday]);
+    }),
+    [chartPalette],
+  );
 
-  const doughnutOptions = useMemo<ChartOptions<"doughnut">>(() => ({
-    responsive: true,
-    maintainAspectRatio: false,
-    cutout: "72%",
-    plugins: {
-      legend: { position: "bottom", labels: { usePointStyle: true, boxWidth: 10, color: "#334155", padding: 16 } },
-      doughnutCenterText: {
-        title: "Present rate",
-        value: `${presentPct}%`,
-        subtitle: `${presentToday}/${Math.max(1, activeEmployees)}`,
+  const doughnutData = useMemo(
+    () => ({
+      labels: ["Present", "Late/Other", "Absent"],
+      datasets: [
+        {
+          data: [presentToday, lateToday, absentToday],
+          backgroundColor: ["#16a34a", "#d97706", "#dc2626"],
+          borderColor: [chartPalette.doughnutBorder, chartPalette.doughnutBorder, chartPalette.doughnutBorder],
+          borderWidth: 5,
+          spacing: 2,
+          borderRadius: 10,
+          hoverOffset: 6,
+        },
+      ],
+    }),
+    [absentToday, chartPalette.doughnutBorder, lateToday, presentToday],
+  );
+
+  const doughnutOptions = useMemo<ChartOptions<"doughnut">>(
+    () => ({
+      responsive: true,
+      maintainAspectRatio: false,
+      cutout: "74%",
+      plugins: {
+        legend: {
+          position: "bottom",
+          labels: { usePointStyle: true, boxWidth: 10, color: chartPalette.legend, padding: 16 },
+        },
+        doughnutCenterText: {
+          title: "Present rate",
+          value: `${presentPct}%`,
+          subtitle: `${presentToday}/${Math.max(1, activeEmployees)}`,
+          titleColor: chartPalette.centerTitle,
+          valueColor: chartPalette.centerValue,
+          subtitleColor: chartPalette.centerSubtitle,
+        } as any,
       } as any,
-    } as any,
-  }), [presentPct, presentToday, activeEmployees]);
+    }),
+    [activeEmployees, chartPalette, presentPct, presentToday],
+  );
 
   function runQuickTour() {
     setTourFocus("kpi");
@@ -375,7 +443,7 @@ export function AdminDashboardPage() {
 
   if (loading) {
     return (
-      <div className="mx-auto w-full max-w-7xl rounded-3xl border border-slate-200/70 bg-white/75 p-5 shadow-sm backdrop-blur dark:border-slate-700/60 dark:bg-slate-900/50">
+      <div className="theme-surface mx-auto w-full max-w-7xl rounded-3xl border p-5 backdrop-blur">
         <div className="mb-4">
           <div className="h-6 w-48 rounded bg-slate-200/60 dark:bg-slate-700/60" />
           <div className="mt-2 h-4 w-80 rounded bg-slate-200/40 dark:bg-slate-700/40" />
@@ -399,8 +467,10 @@ export function AdminDashboardPage() {
         {selectedNotice ? (
           <div className="space-y-3 text-sm">
             <p className="whitespace-pre-wrap text-[rgb(var(--text))]">{selectedNotice.body}</p>
-            <div className="rounded-xl border border-[rgb(var(--border))] bg-[rgb(var(--surface))] p-3 text-[rgb(var(--muted))]">
-              <p>Priority: <span className="font-semibold text-[rgb(var(--text))]">{selectedNotice.priority}</span></p>
+            <div className="rounded-2xl border border-[rgb(var(--border))] bg-[rgb(var(--surface))] p-4 text-[rgb(var(--text-soft))]">
+              <p>
+                Priority: <span className="font-semibold text-[rgb(var(--text))]">{selectedNotice.priority}</span>
+              </p>
               <p>Starts: {selectedNotice.starts_at ? new Date(selectedNotice.starts_at).toLocaleString() : "-"}</p>
               <p>Ends: {selectedNotice.ends_at ? new Date(selectedNotice.ends_at).toLocaleString() : "-"}</p>
             </div>
@@ -409,84 +479,90 @@ export function AdminDashboardPage() {
       </Modal>
 
       <motion.div initial={{ opacity: 0, y: 8 }} animate={{ opacity: 1, y: 0 }} transition={{ duration: 0.24 }}>
-        <Card className="bg-white/75 backdrop-blur dark:bg-slate-900/45">
-          <div className="flex flex-col gap-4 lg:flex-row lg:items-center lg:justify-between">
-            <div className="flex items-start gap-3">
-              <span className="grid h-11 w-11 place-items-center rounded-2xl bg-slate-900 text-sky-200 shadow-sm">
+        <section className="theme-surface rounded-[28px] border p-5 backdrop-blur">
+          <div className="flex flex-col gap-5 lg:flex-row lg:items-center lg:justify-between">
+            <div className="flex items-start gap-4">
+              <span className="theme-surface-strong grid h-12 w-12 place-items-center rounded-2xl border text-sky-200 shadow-sm">
                 <ShieldCheck className="h-5 w-5" />
               </span>
               <div>
-                <div className="text-xs font-semibold uppercase tracking-wider text-[rgb(var(--muted))]">IVS</div>
-                <h1 className="mt-1 text-2xl font-extrabold tracking-tight text-[rgb(var(--text))]">Admin Dashboard</h1>
-                <p className="mt-1 text-sm text-[rgb(var(--muted))]">Quick actions, attendance health, and audit visibility.</p>
+                <div className="text-[11px] font-semibold uppercase tracking-[0.16em] text-[rgb(var(--text-soft))]">Admin Workspace</div>
+                <h1 className="mt-1 text-2xl font-bold tracking-tight text-[rgb(var(--text))]">Operational overview</h1>
+                <p className="mt-1 max-w-2xl text-sm text-[rgb(var(--text-soft))]">
+                  Monitor attendance, notices, and activity from a single clean control surface.
+                </p>
               </div>
             </div>
 
             <div className="flex flex-wrap gap-2">
-              <ClickableChip
+              <DashboardChip
                 pulse={tourFocus === "chip"}
                 tooltip="Open audit logs"
-                label="System Online"
+                label="System online"
                 icon={<Activity className="h-4 w-4" />}
-                className="border-sky-200/60 bg-sky-50/70 text-sky-900 dark:border-sky-400/30 dark:bg-sky-900/30 dark:text-sky-100"
+                className="border-emerald-200 bg-emerald-50 text-emerald-800 dark:border-emerald-500/30 dark:bg-emerald-950/25 dark:text-emerald-200"
                 onClick={() => safeNavigate("/admin/audit-logs")}
               />
-              <ClickableChip
+              <DashboardChip
                 pulse={tourFocus === "chip"}
                 tooltip="View all today's attendance"
-                label={`Present rate: ${presentPct}%`}
+                label={`Present rate ${presentPct}%`}
                 icon={<TrendingUp className="h-4 w-4" />}
-                className="border-slate-200/70 bg-slate-50/70 text-slate-700 dark:border-slate-600/60 dark:bg-slate-800/60 dark:text-slate-200"
+                className="border-slate-200 bg-slate-50 text-slate-700 dark:border-slate-600/60 dark:bg-slate-800/70 dark:text-slate-200"
                 onClick={() => safeNavigate(routeWithQuery("/admin/all-attendance", { filter: "today" }))}
               />
-              <ClickableChip
+              <DashboardChip
                 pulse={tourFocus === "chip"}
                 tooltip="Sort attendance by highest fines"
-                label={`Fine Today/Month: PKR ${totalFineToday.toFixed(2)} / ${monthFineTotal.toFixed(2)}`}
+                label={`Fines PKR ${monthFineTotal.toFixed(2)}`}
                 icon={<Wallet className="h-4 w-4" />}
-                className="border-rose-200/70 bg-rose-50/70 text-rose-700 dark:border-rose-500/40 dark:bg-rose-950/30 dark:text-rose-200"
+                className="border-amber-200 bg-amber-50 text-amber-800 dark:border-amber-500/30 dark:bg-amber-950/25 dark:text-amber-200"
                 onClick={() => safeNavigate(routeWithQuery("/admin/all-attendance", { filter: "month", sort: "fine_desc" }))}
               />
             </div>
           </div>
-        </Card>
+        </section>
       </motion.div>
 
       <div className="grid gap-4 sm:grid-cols-2 xl:grid-cols-4">
-        <ClickableStatCard
+        <DashboardStatCard
           pulse={tourFocus === "kpi"}
           title="Total Staff"
           value={employees.length}
-          subtitle="All employees"
+          subtitle="All employee records"
           icon={<Users className="h-5 w-5" />}
-          gradient="bg-gradient-to-br from-sky-600 via-blue-600 to-indigo-700"
+          cardClass="bg-[linear-gradient(180deg,rgba(239,246,255,0.98),rgba(247,251,255,0.94))] dark:bg-[linear-gradient(180deg,rgba(var(--surface-elevated),1),rgba(var(--surface),1))]"
+          toneClass="border-sky-300/60 bg-sky-500/12 text-sky-700 dark:border-sky-500/30 dark:text-sky-200"
           onClick={() => safeNavigate("/admin/employees")}
         />
-        <ClickableStatCard
+        <DashboardStatCard
           pulse={tourFocus === "kpi"}
           title="Present Today"
           value={presentToday}
-          subtitle="Marked present"
+          subtitle="Successful check-ins"
           icon={<ShieldCheck className="h-5 w-5" />}
-          gradient="bg-gradient-to-br from-emerald-500 via-green-600 to-teal-700"
+          cardClass="bg-[linear-gradient(180deg,rgba(240,253,244,0.98),rgba(247,252,248,0.94))] dark:bg-[linear-gradient(180deg,rgba(var(--surface-elevated),1),rgba(var(--surface),1))]"
+          toneClass="border-emerald-300/60 bg-emerald-500/12 text-emerald-700 dark:border-emerald-500/30 dark:text-emerald-200"
           onClick={() => safeNavigate(routeWithQuery("/admin/all-attendance", { filter: "today", status: "present" }))}
         />
-        <ClickableStatCard
+        <DashboardStatCard
           pulse={tourFocus === "kpi"}
           title="Late Arrivals"
           value={lateToday}
           subtitle="Late records today"
           icon={<Clock3 className="h-5 w-5" />}
-          gradient="bg-gradient-to-br from-amber-500 via-orange-600 to-rose-600"
+          cardClass="bg-[linear-gradient(180deg,rgba(255,251,235,0.98),rgba(255,248,240,0.94))] dark:bg-[linear-gradient(180deg,rgba(var(--surface-elevated),1),rgba(var(--surface),1))]"
+          toneClass="border-amber-300/60 bg-amber-500/12 text-amber-700 dark:border-amber-500/30 dark:text-amber-200"
           onClick={() => safeNavigate(routeWithQuery("/admin/all-attendance", { filter: "today", lateness: "late" }))}
         />
-        <ClickableStatCard
+        <DashboardStatCard
           pulse={tourFocus === "kpi"}
           title="Absent"
           value={absentToday}
           subtitle="Not checked in yet"
           icon={<UserX className="h-5 w-5" />}
-          gradient="bg-gradient-to-br from-rose-500 via-red-600 to-fuchsia-700"
+          cardClass="bg-[linear-gradient(180deg,rgba(255,241,242,0.98),rgba(255,247,249,0.94))] dark:bg-[linear-gradient(180deg,rgba(var(--surface-elevated),1),rgba(var(--surface),1))]"
+          toneClass="border-rose-300/60 bg-rose-500/12 text-rose-700 dark:border-rose-500/30 dark:text-rose-200"
           onClick={() => safeNavigate(routeWithQuery("/admin/all-attendance", { filter: "today", status: "absent" }))}
         />
       </div>
@@ -494,27 +570,36 @@ export function AdminDashboardPage() {
       <Card
         title="Latest Notices"
         subtitle="Top 3 active notices"
-        actions={<Button variant="secondary" size="sm" onClick={() => safeNavigate("/admin/notices")}>Manage Notices</Button>}
+        actions={
+          <Button variant="secondary" size="sm" onClick={() => safeNavigate("/admin/notices")}>
+            Manage Notices
+          </Button>
+        }
+        className="bg-[linear-gradient(180deg,rgba(239,246,255,0.96),rgba(247,251,255,0.94))] dark:bg-[linear-gradient(180deg,rgba(var(--surface-elevated),1),rgba(var(--surface),1))]"
       >
-        <ul className="space-y-2">
+        <ul className="space-y-3">
           {notices.slice(0, 3).length ? (
             notices.slice(0, 3).map((notice) => (
               <li key={notice.id}>
                 <button
                   type="button"
                   onClick={() => setSelectedNotice(notice)}
-                  className="group w-full rounded-2xl border border-slate-200/70 bg-white/60 px-4 py-3 text-left transition hover:border-sky-300 hover:bg-sky-50/50 dark:border-slate-700/60 dark:bg-slate-900/40 dark:hover:border-sky-500/50 dark:hover:bg-sky-950/25"
+                  className="group w-full rounded-2xl border border-sky-100/80 bg-white/68 px-4 py-3.5 text-left transition hover:bg-white/84 dark:border-[rgb(var(--border))] dark:bg-[rgb(var(--surface-muted))] dark:hover:bg-[rgb(var(--surface-elevated))]"
                 >
-                  <div className="flex items-center justify-between gap-2">
-                    <p className="truncate text-sm font-semibold text-[rgb(var(--text))]">{notice.title}</p>
-                    <Bell className="h-4 w-4 text-[rgb(var(--muted))] group-hover:text-sky-500" />
+                  <div className="flex items-start justify-between gap-3">
+                    <div className="min-w-0">
+                      <p className="truncate text-sm font-semibold text-[rgb(var(--text))]">{notice.title}</p>
+                      <p className="mt-1 line-clamp-2 text-xs leading-5 text-[rgb(var(--text-soft))]">{notice.body}</p>
+                    </div>
+                    <span className="grid h-9 w-9 shrink-0 place-items-center rounded-xl border border-sky-100/80 bg-white/82 text-slate-500 transition group-hover:text-slate-900 dark:border-[rgb(var(--border))] dark:bg-[rgb(var(--surface-elevated))] dark:text-[rgb(var(--text-soft))] dark:group-hover:text-[rgb(var(--text))]">
+                      <Bell className="h-4 w-4" />
+                    </span>
                   </div>
-                  <p className="mt-1 line-clamp-2 text-xs text-[rgb(var(--muted))]">{notice.body}</p>
                 </button>
               </li>
             ))
           ) : (
-            <li className="text-sm text-[rgb(var(--muted))]">No active notices.</li>
+            <li className="text-sm text-[rgb(var(--text-soft))]">No active notices.</li>
           )}
         </ul>
       </Card>
@@ -526,18 +611,18 @@ export function AdminDashboardPage() {
           onClick={() => safeNavigate(routeWithQuery("/admin/all-attendance", { filter: "week" }))}
           onKeyDown={(event) => onCardKeyDown(event, () => safeNavigate(routeWithQuery("/admin/all-attendance", { filter: "week" })))}
           className={classNames(
-            "lg:col-span-2 cursor-pointer rounded-3xl border border-slate-200/70 bg-white/75 p-5 shadow-sm transition hover:-translate-y-0.5 hover:shadow-md focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-cyan-300 dark:border-slate-700/60 dark:bg-slate-900/45",
+            "cursor-pointer rounded-3xl border border-sky-100/80 bg-[linear-gradient(180deg,rgba(239,246,255,0.96),rgba(247,251,255,0.94))] p-5 transition hover:-translate-y-0.5 hover:shadow-[0_16px_34px_rgba(var(--shadow-color),0.18)] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-sky-300 dark:border-[rgb(var(--border))] dark:bg-[linear-gradient(180deg,rgba(var(--surface-elevated),1),rgba(var(--surface),1))]",
             tourFocus === "chart" && "animate-pulse",
           )}
         >
-          <div className="mb-3 flex items-center justify-between gap-2">
+          <div className="mb-4 flex items-center justify-between gap-2">
             <div>
-              <h3 className="text-sm font-semibold text-[rgb(var(--text))]">Weekly Attendance</h3>
-              <p className="text-xs text-[rgb(var(--muted))]">Attendance trend across recent dates</p>
+              <h3 className="text-base font-semibold text-[rgb(var(--text))]">Weekly Attendance</h3>
+              <p className="text-sm text-[rgb(var(--text-soft))]">Attendance trend across recent dates</p>
             </div>
-            <span className="text-sm font-medium text-sky-600">View details</span>
+            <span className="text-sm font-medium text-sky-700 dark:text-sky-300">View details</span>
           </div>
-          <div className="h-72 rounded-2xl border border-slate-200/70 bg-white/60 p-3 dark:border-slate-700/60 dark:bg-slate-900/50">
+          <div className="h-72 rounded-2xl border border-sky-100/80 bg-white/74 p-4 dark:border-[rgb(var(--border))] dark:bg-[rgb(var(--surface-muted))]">
             <Line data={lineData as any} options={lineOptions} />
           </div>
         </div>
@@ -548,38 +633,45 @@ export function AdminDashboardPage() {
           onClick={() => safeNavigate(routeWithQuery("/admin/all-attendance", { filter: "today" }))}
           onKeyDown={(event) => onCardKeyDown(event, () => safeNavigate(routeWithQuery("/admin/all-attendance", { filter: "today" })))}
           className={classNames(
-            "cursor-pointer rounded-3xl border border-slate-200/70 bg-white/75 p-5 shadow-sm transition hover:-translate-y-0.5 hover:shadow-md focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-cyan-300 dark:border-slate-700/60 dark:bg-slate-900/45",
+            "cursor-pointer rounded-3xl border border-violet-100/80 bg-[linear-gradient(180deg,rgba(245,243,255,0.96),rgba(250,247,255,0.94))] p-5 transition hover:-translate-y-0.5 hover:shadow-[0_16px_34px_rgba(var(--shadow-color),0.18)] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-sky-300 dark:border-[rgb(var(--border))] dark:bg-[linear-gradient(180deg,rgba(var(--surface-elevated),1),rgba(var(--surface),1))]",
             tourFocus === "chart" && "animate-pulse",
           )}
         >
-          <div className="mb-3 flex items-center justify-between gap-2">
+          <div className="mb-4 flex items-center justify-between gap-2">
             <div>
-              <h3 className="text-sm font-semibold text-[rgb(var(--text))]">Daily Breakdown</h3>
-              <p className="text-xs text-[rgb(var(--muted))]">Present vs late vs absent</p>
+              <h3 className="text-base font-semibold text-[rgb(var(--text))]">Daily Breakdown</h3>
+              <p className="text-sm text-[rgb(var(--text-soft))]">Present vs late vs absent</p>
             </div>
-            <span className="text-sm font-medium text-sky-600">View details</span>
+            <span className="text-sm font-medium text-sky-700 dark:text-sky-300">View details</span>
           </div>
-          <div className="h-72 rounded-2xl border border-slate-200/70 bg-white/60 p-3 dark:border-slate-700/60 dark:bg-slate-900/50">
+          <div className="h-72 rounded-2xl border border-violet-100/80 bg-white/76 p-4 dark:border-[rgb(var(--border))] dark:bg-[rgb(var(--surface-muted))]">
             <Doughnut data={doughnutData as any} options={doughnutOptions} />
           </div>
         </div>
       </div>
 
       <div className="grid gap-6 lg:grid-cols-3">
-        <Card title="Department Performance" subtitle="Present rate by department">
-          <ul className="space-y-2">
+        <Card
+          title="Department Performance"
+          subtitle="Present rate by department"
+          className="bg-[linear-gradient(180deg,rgba(240,253,244,0.96),rgba(247,252,248,0.94))] dark:bg-[linear-gradient(180deg,rgba(var(--surface-elevated),1),rgba(var(--surface),1))]"
+        >
+          <ul className="space-y-2.5">
             {departmentStats.length ? (
               departmentStats.map((d) => (
-                <li key={d.name} className="flex items-center justify-between rounded-2xl border border-slate-200/70 bg-white/60 px-4 py-3 dark:border-slate-700/60 dark:bg-slate-900/40">
+                <li
+                  key={d.name}
+                  className="flex items-center justify-between rounded-2xl border border-emerald-100/80 bg-white/72 px-4 py-3 dark:border-[rgb(var(--border))] dark:bg-[rgb(var(--surface-muted))]"
+                >
                   <span className="inline-flex items-center gap-2 text-sm font-semibold text-[rgb(var(--text))]">
-                    <Building2 className="h-4 w-4 text-[rgb(var(--muted))]" />
+                    <Building2 className="h-4 w-4 text-[rgb(var(--text-soft))]" />
                     {d.name}
                   </span>
-                  <span className="text-sm font-extrabold text-[rgb(var(--text))]">{d.rate}%</span>
+                  <span className="text-sm font-bold text-[rgb(var(--text))]">{d.rate}%</span>
                 </li>
               ))
             ) : (
-              <li className="text-sm text-[rgb(var(--muted))]">No department data.</li>
+              <li className="text-sm text-[rgb(var(--text-soft))]">No department data.</li>
             )}
           </ul>
         </Card>
@@ -587,50 +679,59 @@ export function AdminDashboardPage() {
         <Card
           title="Recent Activity"
           subtitle="Last 6 audit events"
-          actions={<Button variant="ghost" size="sm" onClick={() => safeNavigate("/admin/audit-logs")}>Open Logs</Button>}
+          actions={
+            <Button variant="ghost" size="sm" onClick={() => safeNavigate("/admin/audit-logs")}>
+              Open Logs
+            </Button>
+          }
+          className="bg-[linear-gradient(180deg,rgba(255,251,235,0.96),rgba(255,248,240,0.94))] dark:bg-[linear-gradient(180deg,rgba(var(--surface-elevated),1),rgba(var(--surface),1))]"
         >
-          <ul className="space-y-2">
+          <ul className="space-y-2.5">
             {logs.length ? (
               logs.slice(0, 6).map((log) => (
                 <li key={log.id}>
                   <button
                     type="button"
                     onClick={() => safeNavigate("/admin/audit-logs")}
-                    className="group w-full rounded-2xl border border-slate-200/70 bg-white/60 px-4 py-3 text-left transition hover:border-sky-300 hover:bg-sky-50/50 dark:border-slate-700/60 dark:bg-slate-900/40 dark:hover:border-sky-500/50 dark:hover:bg-sky-950/25"
+                    className="group w-full rounded-2xl border border-amber-100/80 bg-white/72 px-4 py-3 text-left transition hover:bg-white/84 dark:border-[rgb(var(--border))] dark:bg-[rgb(var(--surface-muted))] dark:hover:bg-[rgb(var(--surface-elevated))]"
                   >
                     <div className="flex items-center justify-between gap-3">
                       <p className="text-sm font-semibold text-[rgb(var(--text))]">{log.action}</p>
-                      <ChevronRight className="h-4 w-4 text-[rgb(var(--muted))] group-hover:text-sky-500" />
+                      <ChevronRight className="h-4 w-4 text-[rgb(var(--text-soft))] group-hover:text-[rgb(var(--text))]" />
                     </div>
-                    <p className="mt-1 text-xs text-[rgb(var(--muted))]">{new Date(log.ts).toLocaleString()}</p>
+                    <p className="mt-1 text-xs text-[rgb(var(--text-soft))]">{new Date(log.ts).toLocaleString()}</p>
                   </button>
                 </li>
               ))
             ) : (
-              <li className="text-sm text-[rgb(var(--muted))]">No activity logs.</li>
+              <li className="text-sm text-[rgb(var(--text-soft))]">No activity logs.</li>
             )}
           </ul>
         </Card>
 
-        <Card title="Top Latecomers" subtitle="Today">
-          <ul className="space-y-2">
+        <Card
+          title="Top Latecomers"
+          subtitle="Today"
+          className="bg-[linear-gradient(180deg,rgba(255,241,242,0.96),rgba(255,247,249,0.94))] dark:bg-[linear-gradient(180deg,rgba(var(--surface-elevated),1),rgba(var(--surface),1))]"
+        >
+          <ul className="space-y-2.5">
             {topLatecomers.length ? (
               topLatecomers.map((row) => (
                 <li key={`${row.employeeId}-${row.checkInTime || "na"}`}>
                   <button
                     type="button"
                     onClick={() => safeNavigate(routeWithQuery("/admin/all-attendance", { filter: "today", lateness: "late" }))}
-                    className="w-full rounded-2xl border border-slate-200/70 bg-white/60 px-4 py-3 text-left transition hover:border-sky-300 hover:bg-sky-50/50 dark:border-slate-700/60 dark:bg-slate-900/40 dark:hover:border-sky-500/50 dark:hover:bg-sky-950/25"
+                    className="w-full rounded-2xl border border-rose-100/80 bg-white/72 px-4 py-3 text-left transition hover:bg-white/84 dark:border-[rgb(var(--border))] dark:bg-[rgb(var(--surface-muted))] dark:hover:bg-[rgb(var(--surface-elevated))]"
                   >
                     <p className="text-sm font-semibold text-[rgb(var(--text))]">{row.name}</p>
-                    <p className="mt-1 text-xs text-[rgb(var(--muted))]">
+                    <p className="mt-1 text-xs text-[rgb(var(--text-soft))]">
                       {row.employeeId} • {row.checkInTime || "-"}
                     </p>
                   </button>
                 </li>
               ))
             ) : (
-              <li className="text-sm text-[rgb(var(--muted))]">No late arrivals.</li>
+              <li className="text-sm text-[rgb(var(--text-soft))]">No late arrivals.</li>
             )}
           </ul>
         </Card>

@@ -25,12 +25,12 @@ export function Button({
 }: ButtonProps) {
   const variantClass = {
     primary:
-      "border border-[rgb(var(--primary))] bg-[rgb(var(--primary))] text-[rgb(var(--primary-foreground))] shadow-sm hover:-translate-y-0.5 hover:shadow-md",
+      "border border-[rgb(var(--primary))] bg-[rgb(var(--primary))] text-[rgb(var(--primary-foreground))] shadow-sm hover:-translate-y-0.5 hover:brightness-[1.06] hover:shadow-lg",
     secondary:
-      "border border-[rgb(var(--border))] bg-[rgb(var(--surface))] text-[rgb(var(--text))] hover:bg-[color-mix(in_srgb,rgb(var(--surface))_90%,rgb(var(--text)))]",
+      "border border-[rgb(var(--border))] bg-[rgb(var(--surface-elevated))] text-[rgb(var(--text))] shadow-sm hover:bg-[rgb(var(--surface-muted))]",
     ghost:
-      "border border-transparent bg-transparent text-[rgb(var(--text))] hover:bg-[color-mix(in_srgb,rgb(var(--surface))_88%,rgb(var(--text)))]",
-    danger: "border border-rose-600 bg-rose-600 text-white shadow-sm hover:-translate-y-0.5 hover:bg-rose-700",
+      "border border-transparent bg-transparent text-[rgb(var(--text-soft))] hover:bg-[rgb(var(--surface-muted))] hover:text-[rgb(var(--text))]",
+    danger: "border border-rose-600/80 bg-rose-600 text-white shadow-sm hover:-translate-y-0.5 hover:bg-rose-500",
   }[variant];
 
   const sizeClass = size === "sm" ? "h-8 px-3 text-xs" : size === "lg" ? "h-11 px-5 text-sm" : "h-10 px-4 text-sm";
@@ -39,7 +39,7 @@ export function Button({
     <button
       className={cn(
         "inline-flex items-center justify-center gap-2 rounded-xl font-medium transition-all duration-200",
-        "focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[rgb(var(--primary))]/35 focus-visible:ring-offset-1",
+        "focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[rgba(var(--focus-ring),0.4)] focus-visible:ring-offset-1 focus-visible:ring-offset-[rgb(var(--bg))]",
         "active:translate-y-[1px] disabled:pointer-events-none disabled:opacity-55",
         sizeClass,
         variantClass,

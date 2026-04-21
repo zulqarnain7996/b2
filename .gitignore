@@ -1,10 +1,41 @@
-node_modules
-dist
-.vscode
+# Dependencies
+node_modules/
+backend/.venv/
+.venv/
+
+# Build outputs
+dist/
+build/
+.vite/
+
+# Environment and local secrets
+.env
+.env.*
+!.env.example
+backend/.env
+backend/.env.*
+!backend/.env.example
+*.pem
+*.key
+*.cert
+
+# Runtime files
 *.log
-backend/.venv
-backend/__pycache__
+*.pid
+uploads/
 backend/uploads/*
 !backend/uploads/.gitkeep
-.env
-backend/.env
+
+# Python cache/test output
+__pycache__/
+**/__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Editor/OS files
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db

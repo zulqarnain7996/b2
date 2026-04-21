@@ -1,6 +1,9 @@
 import { FormEvent, useEffect, useMemo, useState } from "react";
+import { useNavigate, useSearchParams } from "react-router-dom";
+import { useAuth } from "@/auth/AuthContext";
 import { Avatar } from "../components/Avatar";
 import { CameraAutoCaptureModal } from "../components/CameraAutoCaptureModal";
+import { DepartmentManagerCard } from "@/components/departments/DepartmentManagerCard";
 import { useToast } from "../components/feedback/ToastProvider";
 import { Alert } from "../components/ui/Alert";
 import { Badge } from "../components/ui/Badge";
@@ -13,6 +16,7 @@ import { PageHeader } from "../components/ui/PageHeader";
 import { Select } from "../components/ui/Select";
 import { Spinner } from "../components/ui/Spinner";
 import { Table } from "../components/ui/Table";
+import { useDepartments } from "@/hooks/useDepartments";
 import { apiClient } from "../services/apiClient";
 import { useDebouncedValue } from "@/hooks/useDebouncedValue";
 import { compressImage, elapsedMs, nowMs } from "../services/imageUtils";
@@ -25,27 +29,47 @@ type EmployeeForm = {
   role: string;
   shift_start_time: string;
   grace_period_mins: number;
-  fine_per_minute_pkr: number;
+  late_fine_pkr: number;
+  absent_fine_pkr: number;
+  not_marked_fine_pkr: number;
+  off_days: string[];
   password: string;
   resetPassword: boolean;
 };
 
-const DEPARTMENTS = ["IT", "Call center", "Accounts", "School", "Quran"] as const;
+const OFF_DAY_OPTIONS = ["sunday", "monday", "tuesday", "wednesday", "thursday", "friday", "saturday"] as const;
+
+function formatOffDays(days?: string[] | null) {
+  return days && days.length ? days.map((day) => day[0].toUpperCase() + day.slice(1)).join(", ") : "Not Set";
+}
 
 const initialForm: EmployeeForm = {
   name: "",
   email: "",
-  department: "IT",
+  department: "",
   role: "user",
   shift_start_time: "09:00",
-  grace_period_mins: 15,
-  fine_per_minute_pkr: 1.5,
+  grace_period_mins: 30,
+  late_fine_pkr: 50,
+  absent_fine_pkr: 100,
+  not_marked_fine_pkr: 10,
+  off_days: [],
   password: "",
   resetPassword: false,
 };
 
 export function AdminEmployeesPage() {
+  const { isAdmin, hasPermission } = useAuth();
+  const navigate = useNavigate();
+  const [searchParams, setSearchParams] = useSearchParams();
   const toast = useToast();
+  const {
+    departments: departmentRecords,
+    loading: departmentsLoading,
+    error: departmentsError,
+    reload: reloadDepartments,
+  } = useDepartments({ admin: isAdmin, includeInactive: isAdmin });
+  
   const [employees, setEmployees] = useState<Employee[]>([]);
   const [usersCount, setUsersCount] = useState(0);
   const [loading, setLoading] = useState(true);
@@ -76,10 +100,21 @@ export function AdminEmployeesPage() {
     () => employees.find((e) => e.id === editId) || null,
     [employees, editId],
   );
-  const departments = useMemo(
-    () => ["all", ...Array.from(new Set(employees.map((e) => e.department).filter(Boolean))).sort()],
-    [employees],
+  const activeDepartmentOptions = useMemo(
+    () => departmentRecords.filter((department) => department.is_active).map((department) => department.name),
+    [departmentRecords],
   );
+  const filterDepartmentOptions = useMemo(
+    () => ["all", ...departmentRecords.map((department) => department.name)],
+    [departmentRecords],
+  );
+  const editDepartmentOptions = useMemo(() => {
+    const values = new Set(activeDepartmentOptions);
+    if (editForm.department) {
+      values.add(editForm.department);
+    }
+    return Array.from(values).sort((a, b) => a.localeCompare(b));
+  }, [activeDepartmentOptions, editForm.department]);
   const filteredEmployees = useMemo(() => {
     const q = debouncedSearch.trim().toLowerCase();
     return employees.filter((emp) => {
@@ -116,13 +151,23 @@ export function AdminEmployeesPage() {
     setPage(1);
   }, [debouncedSearch, roleFilter, statusFilter, departmentFilter]);
 
+  useEffect(() => {
+    if (!form.department && activeDepartmentOptions.length) {
+      setForm((prev) => ({ ...prev, department: activeDepartmentOptions[0] }));
+    }
+  }, [activeDepartmentOptions, form.department]);
+
   async function loadEmployees() {
     setLoading(true);
     setError("");
     try {
+      const employeesPromise = apiClient.getEmployees();
+      const usersPromise = isAdmin || hasPermission("can_manage_users")
+        ? apiClient.getUsers()
+        : Promise.resolve({ ok: true, users: [] });
       const [employeesRes, usersRes] = await Promise.all([
-        apiClient.getEmployees(),
-        apiClient.getUsers(),
+        employeesPromise,
+        usersPromise,
       ]);
       setEmployees(employeesRes.employees);
       setUsersCount(usersRes.users.length);
@@ -137,8 +182,36 @@ export function AdminEmployeesPage() {
   }
 
   useEffect(() => {
-    loadEmployees();
-  }, []);
+    void loadEmployees();
+  }, [hasPermission, isAdmin]);
+
+  function openEditModal(emp: Employee) {
+    setEditId(emp.id);
+    setEditForm({
+      ...emp,
+      shiftStartTime: emp.shiftStartTime || "09:00",
+      gracePeriodMins: Number(emp.gracePeriodMins ?? 15),
+      lateFinePkr: Number(emp.lateFinePkr ?? 0),
+      absentFinePkr: Number(emp.absentFinePkr ?? 0),
+      notMarkedFinePkr: Number(emp.notMarkedFinePkr ?? 0),
+      offDays: emp.offDays || [],
+    });
+  }
+
+  function toggleOffDay(days: string[], value: string) {
+    return days.includes(value) ? days.filter((day) => day !== value) : [...days, value];
+  }
+
+  useEffect(() => {
+    const editTarget = searchParams.get("edit");
+    if (!editTarget || !employees.length) return;
+    const target = employees.find((emp) => emp.id === editTarget);
+    if (!target) return;
+    openEditModal(target);
+    const next = new URLSearchParams(searchParams);
+    next.delete("edit");
+    setSearchParams(next, { replace: true });
+  }, [employees, searchParams, setSearchParams]);
 
   async function onEnrollSubmit(event: FormEvent) {
     event.preventDefault();
@@ -187,7 +260,10 @@ export function AdminEmployeesPage() {
         role: editForm.role,
         shift_start_time: (editForm.shiftStartTime || "") as string,
         grace_period_mins: Number(editForm.gracePeriodMins ?? 15),
-        fine_per_minute_pkr: Number(editForm.finePerMinutePkr ?? 0),
+        late_fine_pkr: Number(editForm.lateFinePkr ?? 0),
+        absent_fine_pkr: Number(editForm.absentFinePkr ?? 0),
+        not_marked_fine_pkr: Number(editForm.notMarkedFinePkr ?? 0),
+        off_days: Array.isArray(editForm.offDays) ? editForm.offDays : [],
         is_active: editForm.isActive,
         imageBase64,
       });
@@ -260,6 +336,10 @@ export function AdminEmployeesPage() {
         actions={
           <div className="flex items-center gap-2">
             <Button onClick={() => {
+              if (!activeDepartmentOptions.length) {
+                toast.error("Create at least one active department before enrolling an employee.");
+                return;
+              }
               setEnrolledEmployeeId(null);
               setCaptureMode("add");
             }}>Add Employee</Button>
@@ -268,10 +348,22 @@ export function AdminEmployeesPage() {
         }
       />
 
+      {isAdmin ? (
+        <DepartmentManagerCard
+          departments={departmentRecords}
+          loading={departmentsLoading}
+          onRefresh={async () => {
+            await reloadDepartments();
+            await loadEmployees();
+          }}
+        />
+      ) : null}
+
       <Card
         title="Enroll With Face Capture"
         subtitle="Capture and register a new employee identity."
       >
+        {departmentsError ? <Alert variant="error">{departmentsError}</Alert> : null}
         {enrolledEmployeeId && (
           <Alert variant="success">
             Employee enrolled successfully. Assigned Employee ID: <strong>{enrolledEmployeeId}</strong>
@@ -293,11 +385,11 @@ export function AdminEmployeesPage() {
         />
 
         {hasCapture && (
-          <Card title="Complete Enrollment" className="border-slate-200 bg-slate-50">
+          <Card title="Complete Enrollment" className="theme-surface-muted border">
             <form onSubmit={onEnrollSubmit} className="grid gap-3" autoComplete="off">
               <input type="text" name="fake-username" autoComplete="username" className="hidden" tabIndex={-1} />
               <input type="password" name="fake-password" autoComplete="new-password" className="hidden" tabIndex={-1} />
-              <img src={capturedImage ?? undefined} alt="Captured" className="h-28 w-28 rounded-xl border border-slate-200 object-cover" />
+              <img src={capturedImage ?? undefined} alt="Captured" className="h-28 w-28 rounded-xl border border-[rgb(var(--border))] object-cover" />
               <div className="grid gap-3 md:grid-cols-2">
                 <Input label="Full Name" placeholder="Full Name" value={form.name} onChange={(e) => setForm({ ...form, name: e.target.value })} required />
                 <Input label="Email" placeholder="Email" value={form.email} onChange={(e) => setForm({ ...form, email: e.target.value })} required />
@@ -305,9 +397,11 @@ export function AdminEmployeesPage() {
                   label="Department"
                   value={form.department}
                   onChange={(e) => setForm({ ...form, department: e.target.value })}
+                  disabled={!activeDepartmentOptions.length}
                   required
                 >
-                  {DEPARTMENTS.map((dep) => (
+                  {!activeDepartmentOptions.length ? <option value="">No active departments</option> : null}
+                  {activeDepartmentOptions.map((dep) => (
                     <option key={dep} value={dep}>
                       {dep}
                     </option>
@@ -334,7 +428,7 @@ export function AdminEmployeesPage() {
               </div>
               <div className="rounded-2xl border border-[rgb(var(--border))] bg-[rgb(var(--surface))] p-4">
                 <p className="mb-3 text-sm font-semibold text-[rgb(var(--text))]">Shift & Fine Settings</p>
-                <div className="grid gap-3 md:grid-cols-3">
+                <div className="grid gap-3 md:grid-cols-2 xl:grid-cols-5">
                   <Input
                     label="Shift Start Time"
                     type="time"
@@ -352,16 +446,63 @@ export function AdminEmployeesPage() {
                     required
                   />
                   <Input
-                    label="Fine Per Minute (PKR)"
+                    label="Late Fine (PKR)"
                     type="number"
                     min={0}
                     step="0.01"
-                    value={String(form.fine_per_minute_pkr)}
-                    onChange={(e) => setForm({ ...form, fine_per_minute_pkr: Number(e.target.value || 0) })}
+                    value={String(form.late_fine_pkr)}
+                    onChange={(e) => setForm({ ...form, late_fine_pkr: Number(e.target.value || 0) })}
+                    required
+                  />
+                  <Input
+                    label="Absent Fine (PKR)"
+                    type="number"
+                    min={0}
+                    step="0.01"
+                    value={String(form.absent_fine_pkr)}
+                    onChange={(e) => setForm({ ...form, absent_fine_pkr: Number(e.target.value || 0) })}
+                    required
+                  />
+                  <Input
+                    label="Not Marked Fine (PKR)"
+                    type="number"
+                    min={0}
+                    step="0.01"
+                    value={String(form.not_marked_fine_pkr)}
+                    onChange={(e) => setForm({ ...form, not_marked_fine_pkr: Number(e.target.value || 0) })}
                     required
                   />
                 </div>
+                <div className="mt-4">
+                  <p className="mb-2 text-xs font-semibold uppercase tracking-[0.12em] text-[rgb(var(--muted))]">Off Days</p>
+                  <div className="flex flex-wrap gap-2">
+                    {OFF_DAY_OPTIONS.map((day) => {
+                      const active = form.off_days.includes(day);
+                      return (
+                        <label
+                          key={day}
+                          className={`inline-flex cursor-pointer items-center gap-2 rounded-full border px-3 py-1.5 text-sm transition-colors ${
+                            active
+                              ? "border-sky-400/35 bg-sky-500/12 text-sky-700 dark:text-sky-200"
+                              : "border-[rgb(var(--border))] bg-[rgb(var(--surface-elevated))] text-[rgb(var(--text-soft))]"
+                          }`}
+                        >
+                          <input
+                            type="checkbox"
+                            className="hidden"
+                            checked={active}
+                            onChange={() => setForm((prev) => ({ ...prev, off_days: toggleOffDay(prev.off_days, day) }))}
+                          />
+                          <span className="capitalize">{day}</span>
+                        </label>
+                      );
+                    })}
+                  </div>
+                </div>
               </div>
+              {!activeDepartmentOptions.length ? (
+                <Alert variant="info">Create an active department first. Employee enrollment is blocked until one exists.</Alert>
+              ) : null}
               <p className="text-sm text-[rgb(var(--muted))]">This password is for employee login.</p>
               <label className="flex items-center gap-2">
                 <input
@@ -372,7 +513,7 @@ export function AdminEmployeesPage() {
                 <span className="text-sm text-[rgb(var(--muted))]">Reset existing user password if this email already exists</span>
               </label>
               <div className="flex items-center gap-2">
-                <Button type="submit" loading={saving}>{saving ? "Saving..." : "Enroll Employee"}</Button>
+                <Button type="submit" loading={saving} disabled={!activeDepartmentOptions.length}>{saving ? "Saving..." : "Enroll Employee"}</Button>
                 <Button variant="secondary" type="button" onClick={() => setCapturedImage(null)}>Discard Capture</Button>
               </div>
             </form>
@@ -406,7 +547,7 @@ export function AdminEmployeesPage() {
             <option value="inactive">Inactive</option>
           </Select>
           <Select value={departmentFilter} onChange={(e) => setDepartmentFilter(e.target.value)}>
-            {departments.map((d) => (
+            {filterDepartmentOptions.map((d) => (
               <option key={d} value={d}>
                 {d === "all" ? "All departments" : d}
               </option>
@@ -456,44 +597,69 @@ export function AdminEmployeesPage() {
                   <th>Department</th>
                   <th>Role</th>
                   <th>Status</th>
+                  <th>Off Days</th>
                   <th>Actions</th>
                 </tr>
               </thead>
               <tbody>
                 {pagedEmployees.map((emp) => (
-                  <tr key={emp.id}>
+                  <tr
+                    key={emp.id}
+                    className="cursor-pointer"
+                    onClick={() => navigate(`/admin/employees/${encodeURIComponent(emp.id)}`)}
+                  >
                     <td>
                       <input
                         type="checkbox"
                         checked={selectedEmployeeIds.includes(emp.id)}
                         onChange={() => toggleEmployeeSelection(emp.id)}
+                        onClick={(event) => event.stopPropagation()}
                         aria-label={`Select employee ${emp.id}`}
                       />
                     </td>
-                    <td><Avatar name={emp.name} src={emp.photoUrl} /></td>
+                    <td>
+                      <button
+                        type="button"
+                        className="rounded-full transition-transform duration-200 hover:scale-[1.03]"
+                        onClick={(event) => {
+                          event.stopPropagation();
+                          navigate(`/admin/employees/${encodeURIComponent(emp.id)}`);
+                        }}
+                        aria-label={`Open employee ${emp.name}`}
+                      >
+                        <Avatar name={emp.name} src={emp.photoUrl} />
+                      </button>
+                    </td>
                     <td>{emp.id}</td>
-                    <td>{emp.name}</td>
+                    <td>
+                      <button
+                        type="button"
+                        className="text-left font-medium text-[rgb(var(--text))] transition-colors duration-200 hover:text-sky-700 dark:hover:text-sky-300"
+                        onClick={(event) => {
+                          event.stopPropagation();
+                          navigate(`/admin/employees/${encodeURIComponent(emp.id)}`);
+                        }}
+                      >
+                        {emp.name}
+                      </button>
+                    </td>
                     <td>{emp.email}</td>
                     <td>{emp.department}</td>
                     <td><Badge variant={emp.role === "admin" ? "admin" : "user"}>{emp.role}</Badge></td>
-                    <td>
-                      <Badge variant={emp.isActive ? "success" : "warn"}>
-                        {emp.isActive ? "Active" : "Inactive"}
-                      </Badge>
-                    </td>
-                    <td>
-                      <div className="flex items-center gap-2">
+                      <td>
+                        <Badge variant={emp.isActive ? "success" : "warn"}>
+                          {emp.isActive ? "Active" : "Inactive"}
+                        </Badge>
+                      </td>
+                      <td className="text-sm text-[rgb(var(--text-soft))]">{formatOffDays(emp.offDays)}</td>
+                      <td>
+                        <div className="flex items-center gap-2">
                         <Button
                           variant="secondary"
                           size="sm"
-                          onClick={() => {
-                            setEditId(emp.id);
-                            setEditForm({
-                              ...emp,
-                              shiftStartTime: emp.shiftStartTime || "09:00",
-                              gracePeriodMins: Number(emp.gracePeriodMins ?? 15),
-                              finePerMinutePkr: Number(emp.finePerMinutePkr ?? 1.5),
-                            });
+                          onClick={(event) => {
+                            event.stopPropagation();
+                            openEditModal(emp);
                           }}
                           title="Edit employee"
                         >
@@ -502,7 +668,10 @@ export function AdminEmployeesPage() {
                         <Button
                           variant="danger"
                           size="sm"
-                          onClick={() => openDeleteConfirm([emp.id])}
+                          onClick={(event) => {
+                            event.stopPropagation();
+                            openDeleteConfirm([emp.id]);
+                          }}
                           title="Delete employee"
                         >
                           Delete
@@ -513,7 +682,7 @@ export function AdminEmployeesPage() {
                 ))}
               </tbody>
             </Table>
-            <div className="mt-3 flex items-center justify-between text-sm text-slate-600">
+            <div className="mt-3 flex items-center justify-between text-sm text-[rgb(var(--text-soft))]">
               <span>
                 Page {page} of {totalPages}
               </span>
@@ -556,10 +725,12 @@ export function AdminEmployeesPage() {
           <Input label="Email" value={editForm.email || ""} onChange={(e) => setEditForm({ ...editForm, email: e.target.value })} placeholder="Email" />
           <Select
             label="Department"
-            value={editForm.department || "IT"}
+            value={editForm.department || ""}
             onChange={(e) => setEditForm({ ...editForm, department: e.target.value })}
+            disabled={!editDepartmentOptions.length}
           >
-            {DEPARTMENTS.map((dep) => (
+            {!editDepartmentOptions.length ? <option value="">No available departments</option> : null}
+            {editDepartmentOptions.map((dep) => (
               <option key={dep} value={dep}>
                 {dep}
               </option>
@@ -592,15 +763,62 @@ export function AdminEmployeesPage() {
             onChange={(e) => setEditForm({ ...editForm, gracePeriodMins: Number(e.target.value || 0) })}
           />
           <Input
-            label="Fine Per Minute (PKR)"
+            label="Late Fine (PKR)"
             type="number"
             min={0}
             step="0.01"
-            value={String(editForm.finePerMinutePkr ?? 0)}
-            onChange={(e) => setEditForm({ ...editForm, finePerMinutePkr: Number(e.target.value || 0) })}
+            value={String(editForm.lateFinePkr ?? 0)}
+            onChange={(e) => setEditForm({ ...editForm, lateFinePkr: Number(e.target.value || 0) })}
+          />
+          <Input
+            label="Absent Fine (PKR)"
+            type="number"
+            min={0}
+            step="0.01"
+            value={String(editForm.absentFinePkr ?? 0)}
+            onChange={(e) => setEditForm({ ...editForm, absentFinePkr: Number(e.target.value || 0) })}
+          />
+          <Input
+            label="Not Marked Fine (PKR)"
+            type="number"
+            min={0}
+            step="0.01"
+            value={String(editForm.notMarkedFinePkr ?? 0)}
+            onChange={(e) => setEditForm({ ...editForm, notMarkedFinePkr: Number(e.target.value || 0) })}
           />
         </div>
-        {reenrollImage && <img src={reenrollImage} alt="Re-enroll" className="mt-3 h-28 w-28 rounded-xl border border-slate-200 object-cover" />}
+        <div className="mt-4">
+          <p className="mb-2 text-xs font-semibold uppercase tracking-[0.12em] text-[rgb(var(--muted))]">Off Days</p>
+          <div className="flex flex-wrap gap-2">
+            {OFF_DAY_OPTIONS.map((day) => {
+              const active = Array.isArray(editForm.offDays) && editForm.offDays.includes(day);
+              return (
+                <label
+                  key={day}
+                  className={`inline-flex cursor-pointer items-center gap-2 rounded-full border px-3 py-1.5 text-sm transition-colors ${
+                    active
+                      ? "border-sky-400/35 bg-sky-500/12 text-sky-700 dark:text-sky-200"
+                      : "border-[rgb(var(--border))] bg-[rgb(var(--surface-elevated))] text-[rgb(var(--text-soft))]"
+                  }`}
+                >
+                  <input
+                    type="checkbox"
+                    className="hidden"
+                    checked={active}
+                    onChange={() =>
+                      setEditForm((prev) => ({
+                        ...prev,
+                        offDays: toggleOffDay(Array.isArray(prev.offDays) ? prev.offDays : [], day),
+                      }))
+                    }
+                  />
+                  <span className="capitalize">{day}</span>
+                </label>
+              );
+            })}
+          </div>
+        </div>
+        {reenrollImage && <img src={reenrollImage} alt="Re-enroll" className="mt-3 h-28 w-28 rounded-xl border border-[rgb(var(--border))] object-cover" />}
       </Modal>
 
       <CameraAutoCaptureModal

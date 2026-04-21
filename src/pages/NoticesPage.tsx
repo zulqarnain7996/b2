@@ -4,6 +4,7 @@ import { Badge } from "@/components/ui/Badge";
 import { Card } from "@/components/ui/Card";
 import { EmptyState } from "@/components/ui/EmptyState";
 import { PageHeader } from "@/components/ui/PageHeader";
+import { NoticeDetailModal } from "@/components/notices/NoticeDetailModal";
 import { apiClient } from "@/services/apiClient";
 import type { Notice } from "@/types";
 
@@ -29,6 +30,7 @@ export function NoticesPage() {
   const [notices, setNotices] = useState<Notice[]>([]);
   const [loading, setLoading] = useState(true);
   const [activeCategory, setActiveCategory] = useState<NoticeCategory>("current");
+  const [selectedNotice, setSelectedNotice] = useState<NoticeWithDates | null>(null);
 
   useEffect(() => {
     let mounted = true;
@@ -152,7 +154,7 @@ export function NoticesPage() {
               : "Notices currently active."
         }
       >
-        {loading ? <p className="text-sm text-slate-500">Loading notices...</p> : null}
+        {loading ? <p className="text-sm text-[rgb(var(--muted))]">Loading notices...</p> : null}
 
         {!loading && activeList.length === 0 ? (
           <EmptyState
@@ -178,18 +180,28 @@ export function NoticesPage() {
             {activeList.map((notice) => (
               <div
                 key={notice.id}
-                className="rounded-2xl border border-slate-200 bg-white p-4 shadow-sm transition-all duration-200 hover:shadow-md"
+                role="button"
+                tabIndex={0}
+                onClick={() => setSelectedNotice(notice)}
+                onKeyDown={(event) => {
+                  if (event.key === "Enter" || event.key === " ") {
+                    event.preventDefault();
+                    setSelectedNotice(notice);
+                  }
+                }}
+                className="theme-surface cursor-pointer rounded-2xl border p-4 transition-all duration-200 hover:-translate-y-0.5 hover:shadow-md focus:outline-none focus:ring-4 focus:ring-[rgba(var(--focus-ring),0.18)]"
               >
                 <div className="flex flex-wrap items-center gap-2">
                   <Badge variant={notice.priority}>{notice.priority}</Badge>
-                  <h3 className="text-lg font-semibold text-slate-900">{notice.title}</h3>
+                  {notice.is_sticky ? <Badge variant="important">Sticky</Badge> : null}
+                  <h3 className="text-lg font-semibold text-[rgb(var(--text))]">{notice.title}</h3>
                 </div>
 
-                <p className="mt-2 line-clamp-3 whitespace-pre-wrap text-sm leading-6 text-slate-700">
+                <p className="mt-2 line-clamp-3 whitespace-pre-wrap text-sm leading-6 text-[rgb(var(--text-soft))]">
                   {notice.body}
                 </p>
 
-                <p className="mt-3 text-xs text-slate-500">
+                <p className="mt-3 text-xs text-[rgb(var(--muted))]">
                   {activeCategory === "upcoming"
                     ? `Starts: ${formatDate(notice.startsDate)}`
                     : activeCategory === "past"
@@ -200,11 +212,18 @@ export function NoticesPage() {
                   {" | "}
                   Posted: {formatDate(parseDate(notice.created_at))}
                 </p>
+                <p className="mt-2 text-xs font-medium text-sky-700 dark:text-sky-200">Click to view details</p>
               </div>
             ))}
           </div>
         ) : null}
       </Card>
+
+      <NoticeDetailModal
+        notice={selectedNotice}
+        isOpen={!!selectedNotice}
+        onClose={() => setSelectedNotice(null)}
+      />
     </div>
   );
 }

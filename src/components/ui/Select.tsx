@@ -7,8 +7,8 @@ type SelectProps = SelectHTMLAttributes<HTMLSelectElement> & {
 
 export function Select({ label, className = "", children, ...props }: SelectProps) {
   const selectClass = cn(
-    "h-10 w-full rounded-xl border border-[rgb(var(--border))] bg-[rgb(var(--surface))] px-3 text-sm text-[rgb(var(--text))] shadow-sm outline-none transition",
-    "focus:border-[rgb(var(--primary))] focus:ring-4 focus:ring-[rgb(var(--primary))]/20 focus-visible:outline-none disabled:opacity-50",
+    "h-10 w-full rounded-xl border border-[rgb(var(--border))] bg-[rgb(var(--surface-elevated))] px-3 text-sm text-[rgb(var(--text))] shadow-sm outline-none transition",
+    "focus:border-[rgb(var(--primary))] focus:ring-4 focus:ring-[rgba(var(--focus-ring),0.18)] focus-visible:outline-none disabled:opacity-50",
     className,
   );
 

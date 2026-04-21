@@ -77,9 +77,9 @@ export function AdminEmployeeAttendanceReportPage() {
             <div className="flex flex-wrap items-center gap-4">
               <Avatar name={data.employee.name} src={data.employee.photo_url || ""} size={56} />
               <div>
-                <p className="text-base font-semibold text-slate-900">{data.employee.name}</p>
-                <p className="text-sm text-slate-600">{data.employee.email}</p>
-                <p className="text-sm text-slate-600">
+                <p className="text-base font-semibold text-[rgb(var(--text))]">{data.employee.name}</p>
+                <p className="text-sm text-[rgb(var(--text-soft))]">{data.employee.email}</p>
+                <p className="text-sm text-[rgb(var(--text-soft))]">
                   {data.employee.department} | {data.employee.role}
                 </p>
               </div>

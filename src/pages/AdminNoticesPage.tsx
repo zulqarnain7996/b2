@@ -1,4 +1,5 @@
 import { FormEvent, useEffect, useMemo, useState } from "react";
+import { useAuth } from "@/auth/AuthContext";
 import { useToast } from "@/components/feedback/ToastProvider";
 import { Button } from "@/components/ui/Button";
 import { Card } from "@/components/ui/Card";
@@ -10,14 +11,25 @@ import { Select } from "@/components/ui/Select";
 import { Table } from "@/components/ui/Table";
 import { Textarea } from "@/components/ui/Textarea";
 import { Badge } from "@/components/ui/Badge";
+import { NoticeDetailModal } from "@/components/notices/NoticeDetailModal";
+import { useDepartments } from "@/hooks/useDepartments";
 import { apiClient } from "@/services/apiClient";
-import type { AdminNotice, NoticePriority } from "@/types";
+import type { AdminNotice, NoticeAudience, NoticePriority } from "@/types";
 
 type NoticeFormState = {
   title: string;
   body: string;
   priority: NoticePriority;
   is_active: boolean;
+  is_sticky: boolean;
+  show_on_login: boolean;
+  show_on_refresh: boolean;
+  repeat_every_login: boolean;
+  is_dismissible: boolean;
+  requires_acknowledgement: boolean;
+  target_audience: NoticeAudience;
+  target_department: string;
+  target_role: string;
   starts_at: string;
   ends_at: string;
 };
@@ -27,6 +39,15 @@ const initialForm: NoticeFormState = {
   body: "",
   priority: "normal",
   is_active: true,
+  is_sticky: false,
+  show_on_login: false,
+  show_on_refresh: false,
+  repeat_every_login: false,
+  is_dismissible: false,
+  requires_acknowledgement: false,
+  target_audience: "all",
+  target_department: "",
+  target_role: "",
   starts_at: "",
   ends_at: "",
 };
@@ -47,11 +68,14 @@ function formatDate(value: string | null): string {
 }
 
 export function AdminNoticesPage() {
+  const { isAdmin } = useAuth();
   const toast = useToast();
+  const { departments: departmentRecords } = useDepartments({ admin: isAdmin, includeInactive: isAdmin });
   const [notices, setNotices] = useState<AdminNotice[]>([]);
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
   const [modalOpen, setModalOpen] = useState(false);
+  const [detailNotice, setDetailNotice] = useState<AdminNotice | null>(null);
   const [editingNoticeId, setEditingNoticeId] = useState<number | null>(null);
   const [form, setForm] = useState<NoticeFormState>(initialForm);
 
@@ -90,6 +114,15 @@ export function AdminNoticesPage() {
       body: notice.body,
       priority: notice.priority,
       is_active: notice.is_active,
+      is_sticky: notice.is_sticky,
+      show_on_login: notice.show_on_login,
+      show_on_refresh: notice.show_on_refresh,
+      repeat_every_login: notice.repeat_every_login,
+      is_dismissible: notice.is_dismissible,
+      requires_acknowledgement: notice.requires_acknowledgement,
+      target_audience: notice.target_audience,
+      target_department: notice.target_department || "",
+      target_role: notice.target_role || "",
       starts_at: toDateTimeLocal(notice.starts_at),
       ends_at: toDateTimeLocal(notice.ends_at),
     });
@@ -114,6 +147,15 @@ export function AdminNoticesPage() {
         body: form.body.trim(),
         priority: form.priority,
         is_active: form.is_active,
+        is_sticky: form.is_sticky,
+        show_on_login: form.show_on_login || form.repeat_every_login || form.requires_acknowledgement,
+        show_on_refresh: form.show_on_refresh,
+        repeat_every_login: form.repeat_every_login,
+        is_dismissible: form.is_dismissible,
+        requires_acknowledgement: form.requires_acknowledgement,
+        target_audience: form.target_audience,
+        target_department: form.target_department.trim() || null,
+        target_role: form.target_role.trim() || null,
         starts_at: form.starts_at || null,
         ends_at: form.ends_at || null,
       };
@@ -154,6 +196,15 @@ export function AdminNoticesPage() {
         body: notice.body,
         priority: notice.priority,
         is_active: !notice.is_active,
+        is_sticky: notice.is_sticky,
+        show_on_login: notice.show_on_login,
+        show_on_refresh: notice.show_on_refresh,
+        repeat_every_login: notice.repeat_every_login,
+        is_dismissible: notice.is_dismissible,
+        requires_acknowledgement: notice.requires_acknowledgement,
+        target_audience: notice.target_audience,
+        target_department: notice.target_department,
+        target_role: notice.target_role,
         starts_at: toDateTimeLocal(notice.starts_at) || null,
         ends_at: toDateTimeLocal(notice.ends_at) || null,
       });
@@ -191,6 +242,7 @@ export function AdminNoticesPage() {
               <tr>
                 <th>Title</th>
                 <th>Priority</th>
+                <th>Behavior</th>
                 <th>Active</th>
                 <th>Starts</th>
                 <th>Ends</th>
@@ -202,13 +254,23 @@ export function AdminNoticesPage() {
               {notices.map((notice) => (
                 <tr key={notice.id}>
                   <td>
-                    <div>
+                    <button type="button" className="text-left" onClick={() => setDetailNotice(notice)}>
                       <p className="font-medium text-slate-900">{notice.title}</p>
                       <p className="line-clamp-2 text-xs text-slate-500">{notice.body}</p>
-                    </div>
+                    </button>
                   </td>
                   <td>
                     <Badge variant={notice.priority}>{notice.priority}</Badge>
+                  </td>
+                  <td>
+                    <div className="flex flex-wrap gap-1.5">
+                      {notice.is_sticky ? <Badge variant="important">Sticky</Badge> : null}
+                      {notice.show_on_login ? <Badge variant="default">Login</Badge> : null}
+                      {notice.show_on_refresh ? <Badge variant="normal">Refresh</Badge> : null}
+                      {notice.repeat_every_login ? <Badge variant="warn">Repeat</Badge> : null}
+                      {notice.is_dismissible ? <Badge variant="normal">Dismiss</Badge> : null}
+                      {notice.requires_acknowledgement ? <Badge variant="urgent">Ack</Badge> : null}
+                    </div>
                   </td>
                   <td>
                     <label className="inline-flex cursor-pointer items-center gap-2">
@@ -225,6 +287,9 @@ export function AdminNoticesPage() {
                   <td>{formatDate(notice.created_at)}</td>
                   <td>
                     <div className="flex items-center gap-2">
+                      <Button variant="secondary" size="sm" onClick={() => setDetailNotice(notice)}>
+                        View
+                      </Button>
                       <Button variant="secondary" size="sm" onClick={() => openEditModal(notice)}>
                         Edit
                       </Button>
@@ -301,6 +366,48 @@ export function AdminNoticesPage() {
             </Select>
           </div>
           <div className="grid gap-3 md:grid-cols-2">
+            <Select
+              label="Target Audience"
+              value={form.target_audience}
+              onChange={(e) => setForm((prev) => ({ ...prev, target_audience: e.target.value as NoticeAudience }))}
+            >
+              <option value="all">All users</option>
+              <option value="admins_only">Admins only</option>
+              <option value="users_only">Normal users only</option>
+            </Select>
+            <Select
+              label="Target Department"
+              value={form.target_department}
+              onChange={(e) => setForm((prev) => ({ ...prev, target_department: e.target.value }))}
+            >
+              <option value="">All departments</option>
+              {departmentRecords.map((department) => (
+                <option key={department.id} value={department.name}>
+                  {department.name}{department.is_active ? "" : " (inactive)"}
+                </option>
+              ))}
+            </Select>
+          </div>
+          <div className="grid gap-3 md:grid-cols-2">
+            <Input
+              label="Target Role"
+              value={form.target_role}
+              onChange={(e) => setForm((prev) => ({ ...prev, target_role: e.target.value }))}
+              placeholder="Optional employee role"
+            />
+            <div className="rounded-2xl border border-[rgb(var(--border))] bg-[rgb(var(--surface-muted))] p-3">
+              <p className="text-xs font-semibold uppercase tracking-[0.14em] text-[rgb(var(--muted))]">Behavior</p>
+              <div className="mt-3 grid gap-2 text-sm text-[rgb(var(--text))]">
+                <label className="inline-flex items-center gap-2"><input type="checkbox" checked={form.is_sticky} onChange={(e) => setForm((prev) => ({ ...prev, is_sticky: e.target.checked }))} />Sticky in notice list</label>
+                <label className="inline-flex items-center gap-2"><input type="checkbox" checked={form.show_on_login} onChange={(e) => setForm((prev) => ({ ...prev, show_on_login: e.target.checked }))} />Show on login</label>
+                <label className="inline-flex items-center gap-2"><input type="checkbox" checked={form.show_on_refresh} onChange={(e) => setForm((prev) => ({ ...prev, show_on_refresh: e.target.checked }))} />Show on each refresh</label>
+                <label className="inline-flex items-center gap-2"><input type="checkbox" checked={form.repeat_every_login} onChange={(e) => setForm((prev) => ({ ...prev, repeat_every_login: e.target.checked, show_on_login: e.target.checked ? true : prev.show_on_login }))} />Repeat on every login</label>
+                <label className="inline-flex items-center gap-2"><input type="checkbox" checked={form.is_dismissible} onChange={(e) => setForm((prev) => ({ ...prev, is_dismissible: e.target.checked }))} />Dismissible by user</label>
+                <label className="inline-flex items-center gap-2"><input type="checkbox" checked={form.requires_acknowledgement} onChange={(e) => setForm((prev) => ({ ...prev, requires_acknowledgement: e.target.checked, show_on_login: e.target.checked ? true : prev.show_on_login }))} />Require acknowledgement</label>
+              </div>
+            </div>
+          </div>
+          <div className="grid gap-3 md:grid-cols-2">
             <Input
               label="Starts At"
               type="datetime-local"
@@ -316,6 +423,12 @@ export function AdminNoticesPage() {
           </div>
         </form>
       </Modal>
+
+      <NoticeDetailModal
+        notice={detailNotice}
+        isOpen={!!detailNotice}
+        onClose={() => setDetailNotice(null)}
+      />
     </div>
   );
 }

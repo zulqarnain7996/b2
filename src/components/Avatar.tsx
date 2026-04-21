@@ -17,14 +17,14 @@ export function Avatar({ name, src, size = 44 }: AvatarProps) {
   return (
     <div
       style={{ width: size, height: size }}
-      className="inline-flex shrink-0 items-center justify-center overflow-hidden rounded-full bg-slate-200 ring-2 ring-white"
+      className="inline-flex shrink-0 items-center justify-center overflow-hidden rounded-full border border-[rgb(var(--border))] bg-[rgb(var(--surface-muted))] ring-2 ring-[rgb(var(--surface-elevated))]"
       aria-label={`Avatar for ${name}`}
       title={name}
     >
       {resolved ? (
         <img src={resolved} alt={name} className="h-full w-full object-cover" loading="lazy" />
       ) : (
-        <span className="text-xs font-semibold text-slate-700">{initialsFromName(name)}</span>
+        <span className="text-xs font-semibold text-[rgb(var(--text-soft))]">{initialsFromName(name)}</span>
       )}
     </div>
   );

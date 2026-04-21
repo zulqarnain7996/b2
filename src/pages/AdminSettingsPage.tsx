@@ -11,13 +11,17 @@ import { apiClient } from "@/services/apiClient";
 type SettingsForm = {
   shift_start_time: string;
   grace_period_mins: number;
-  fine_per_minute_pkr: number;
+  late_fine_pkr: number;
+  absent_fine_pkr: number;
+  not_marked_fine_pkr: number;
 };
 
 const initialForm: SettingsForm = {
   shift_start_time: "09:00",
   grace_period_mins: 15,
-  fine_per_minute_pkr: 0,
+  late_fine_pkr: 0,
+  absent_fine_pkr: 0,
+  not_marked_fine_pkr: 0,
 };
 
 function normalizeTimeForInput(value: string) {
@@ -42,7 +46,9 @@ export function AdminSettingsPage() {
       setForm({
         shift_start_time: normalizeTimeForInput(res.settings.shift_start_time),
         grace_period_mins: Number(res.settings.grace_period_mins || 0),
-        fine_per_minute_pkr: Number(res.settings.fine_per_minute_pkr || 0),
+        late_fine_pkr: Number(res.settings.late_fine_pkr || 0),
+        absent_fine_pkr: Number(res.settings.absent_fine_pkr || 0),
+        not_marked_fine_pkr: Number(res.settings.not_marked_fine_pkr || 0),
       });
       setUpdatedAt(res.settings.updated_at);
     } catch (e) {
@@ -66,13 +72,17 @@ export function AdminSettingsPage() {
       const payload = {
         shift_start_time: normalizeTimeForInput(form.shift_start_time),
         grace_period_mins: Number(form.grace_period_mins || 0),
-        fine_per_minute_pkr: Number(form.fine_per_minute_pkr || 0),
+        late_fine_pkr: Number(form.late_fine_pkr || 0),
+        absent_fine_pkr: Number(form.absent_fine_pkr || 0),
+        not_marked_fine_pkr: Number(form.not_marked_fine_pkr || 0),
       };
       const res = await apiClient.updateAdminSettings(payload);
       setForm({
         shift_start_time: normalizeTimeForInput(res.settings.shift_start_time),
         grace_period_mins: Number(res.settings.grace_period_mins || 0),
-        fine_per_minute_pkr: Number(res.settings.fine_per_minute_pkr || 0),
+        late_fine_pkr: Number(res.settings.late_fine_pkr || 0),
+        absent_fine_pkr: Number(res.settings.absent_fine_pkr || 0),
+        not_marked_fine_pkr: Number(res.settings.not_marked_fine_pkr || 0),
       });
       setUpdatedAt(res.settings.updated_at);
       toast.success("Shift configuration updated.");
@@ -87,7 +97,7 @@ export function AdminSettingsPage() {
 
   return (
     <div className="mx-auto w-full max-w-4xl space-y-5">
-      <PageHeader title="Shift Configuration" subtitle="Manage global shift start, grace period, and per-minute fine in PKR." />
+      <PageHeader title="Shift Configuration" subtitle="Manage global shift start, grace period, and fixed attendance fines in PKR." />
 
       <Card title="Attendance Fine Settings" subtitle="These values are used for all new attendance records.">
         {loading ? (
@@ -97,7 +107,7 @@ export function AdminSettingsPage() {
         ) : (
           <form className="grid gap-4" onSubmit={onSubmit}>
             {error ? <Alert variant="error">{error}</Alert> : null}
-            <div className="grid gap-3 md:grid-cols-3">
+            <div className="grid gap-3 md:grid-cols-2 xl:grid-cols-5">
               <Input
                 label="Shift Start Time"
                 type="time"
@@ -115,12 +125,30 @@ export function AdminSettingsPage() {
                 required
               />
               <Input
-                label="Fine Per Minute (PKR)"
+                label="Late Fine (PKR)"
                 type="number"
                 min={0}
                 step="0.01"
-                value={String(form.fine_per_minute_pkr)}
-                onChange={(e) => setForm((prev) => ({ ...prev, fine_per_minute_pkr: Number(e.target.value || 0) }))}
+                value={String(form.late_fine_pkr)}
+                onChange={(e) => setForm((prev) => ({ ...prev, late_fine_pkr: Number(e.target.value || 0) }))}
+                required
+              />
+              <Input
+                label="Absent Fine (PKR)"
+                type="number"
+                min={0}
+                step="0.01"
+                value={String(form.absent_fine_pkr)}
+                onChange={(e) => setForm((prev) => ({ ...prev, absent_fine_pkr: Number(e.target.value || 0) }))}
+                required
+              />
+              <Input
+                label="Not Marked Fine (PKR)"
+                type="number"
+                min={0}
+                step="0.01"
+                value={String(form.not_marked_fine_pkr)}
+                onChange={(e) => setForm((prev) => ({ ...prev, not_marked_fine_pkr: Number(e.target.value || 0) }))}
                 required
               />
             </div>
@@ -144,4 +172,3 @@ export function AdminSettingsPage() {
     </div>
   );
 }
-

@@ -17,7 +17,7 @@ export function Table({
   className = "",
 }: TableProps) {
   return (
-    <div className={cn("overflow-auto rounded-2xl border border-[rgb(var(--border))] bg-[rgb(var(--surface))]", className)}>
+    <div className={cn("overflow-auto rounded-2xl border border-[rgb(var(--border))] bg-[rgb(var(--surface))] shadow-[0_14px_30px_rgba(var(--shadow-color),0.06)]", className)}>
       <table
         className={cn(
           "ui-data-table min-w-full text-sm",

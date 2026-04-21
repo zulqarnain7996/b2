@@ -1,10 +1,13 @@
 from __future__ import annotations
 
 
+import ast
 import json
 import os
 import base64
 import hashlib
+import secrets
+import re
 import cv2
 import random
 import shutil
@@ -19,7 +22,8 @@ from pathlib import Path
 
 import numpy as np
 from dotenv import load_dotenv
-from fastapi import APIRouter, Body, Depends, FastAPI, HTTPException, Query, Request, UploadFile, File, status
+from fastapi import APIRouter, Body, Depends, FastAPI, HTTPException, Query, Request, UploadFile, File, Form, status
+from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from fastapi.responses import FileResponse, StreamingResponse
@@ -29,7 +33,19 @@ from mysql.connector.errors import IntegrityError
 from PIL import Image, UnidentifiedImageError
 from starlette.background import BackgroundTask
 
-from app.auth import create_access_token, get_current_user, hash_password, require_admin, verify_password
+from app.auth import (
+    _load_permissions,
+    create_access_token,
+    get_allowed_departments,
+    get_current_user,
+    has_effective_permission,
+    has_permission,
+    hash_password,
+    require_admin,
+    require_permission,
+    resolve_effective_permission_key,
+    verify_password,
+)
 from app.cache import get as cache_get
 from app.cache import invalidate as cache_invalidate
 from app.cache import set_value as cache_set
@@ -38,23 +54,29 @@ from app.face import face_engine
 from app.images import UPLOAD_DIR, create_thumbnail
 from app.init_db import run as init_db
 from app.models import (
+    AppSettingsUpdateRequest,
+    AdminResetEmployeePasswordRequest,
     BulkDeleteEmployeesRequest,
     BulkDeleteUsersRequest,
+    ChangePasswordRequest,
     CheckInRequest,
     CheckInMeRequest,
-    CheckinStartRequest,
-    CheckinFrameRequest,
     CheckinCompleteRequest,
-    ChangePasswordRequest,
+    CheckinFrameRequest,
+    CheckinStartRequest,
+    DepartmentCreateRequest,
+    DepartmentUpdateRequest,
     EnrollEmployeeRequest,
     LinkEmployeeRequest,
     LoginRequest,
     MarkMonthlyAttendanceRequest,
     NoticeCreateRequest,
     NoticeUpdateRequest,
-    AppSettingsUpdateRequest,
-    UpdateUserRequest,
+    PERMISSION_KEYS,
+    SCOPED_PERMISSION_KEYS,
+    UpdateAttendanceRequest,
     UpdateEmployeeRequest,
+    UpdateUserRequest,
 )
 from app.notices_repo import (
     delete_notice,
@@ -67,11 +89,31 @@ from app.notices_repo import (
 )
 
 load_dotenv(Path(__file__).resolve().parents[1] / ".env")
+print("MAIN.PY LOADED - employees accessible fix active")
 
 app = FastAPI(title="Face Attendance API")
 api = APIRouter(prefix="/api")
 
-cors_origins = [o.strip() for o in os.getenv("CORS_ORIGINS", "http://localhost:5173").split(",") if o.strip()]
+DEFAULT_CORS_ORIGINS = [
+    "https://localhost:5173",
+    "https://127.0.0.1:5173",
+    "https://192.168.18.137:5173",
+    "http://localhost:5173",
+    "http://127.0.0.1:5173",
+    "http://192.168.18.137:5173",
+]
+
+
+def _normalize_origin(value: str) -> str:
+    return value.strip().rstrip("/")
+
+
+env_cors_origins = [
+    _normalize_origin(origin)
+    for origin in os.getenv("CORS_ORIGINS", "").split(",")
+    if _normalize_origin(origin)
+]
+cors_origins = list(dict.fromkeys([*DEFAULT_CORS_ORIGINS, *env_cors_origins]))
 app.add_middleware(
     CORSMiddleware,
     allow_origins=cors_origins,
@@ -92,7 +134,16 @@ _checkin_session_lock = threading.Lock()
 _checkin_runtime: dict[str, dict] = {}
 MAX_MANUAL_SELFIE_BYTES = 5 * 1024 * 1024
 ALLOWED_MANUAL_SELFIE_TYPES = {"image/jpeg", "image/jpg", "image/png"}
-ALLOWED_DEPARTMENTS = {"IT", "Call center", "Accounts", "School", "Quran"}
+VALID_OFF_DAYS = ("sunday", "monday", "tuesday", "wednesday", "thursday", "friday", "saturday")
+WEEKDAY_BY_INDEX = {
+    0: "monday",
+    1: "tuesday",
+    2: "wednesday",
+    3: "thursday",
+    4: "friday",
+    5: "saturday",
+    6: "sunday",
+}
 LIVENESS_CHALLENGES = ("blink", "turn_left", "turn_right", "smile")
 LIVENESS_EXPIRES_SECONDS = 120
 SCAN_FLOW_DIRECTIONS = ("center", "left", "right", "up", "down")
@@ -107,6 +158,30 @@ BACKUP_MAX_UPLOAD_BYTES = int(os.getenv("BACKUP_MAX_UPLOAD_BYTES", str(200 * 102
 BACKUP_ALLOWED_MIME_TYPES = {"application/zip", "application/x-zip-compressed", "multipart/x-zip"}
 _maintenance_lock = threading.Lock()
 _maintenance_mode = False
+_PERMISSION_KEY_PATTERN = re.compile(r"key='([^']+)'")
+_ALLOWED_DEPARTMENTS_PATTERN = re.compile(r"allowed_departments=(\[.*\])$")
+
+
+@app.exception_handler(RequestValidationError)
+async def request_validation_exception_handler(request: Request, exc: RequestValidationError):
+    try:
+        body = await request.body()
+        body_text = body.decode("utf-8", errors="replace")
+    except Exception:
+        body_text = "<unavailable>"
+    print(
+        "[validation-error]",
+        json.dumps(
+            {
+                "path": str(request.url.path),
+                "method": request.method,
+                "errors": exc.errors(),
+                "body": body_text,
+            },
+            default=str,
+        ),
+    )
+    return JSONResponse(status_code=422, content={"detail": exc.errors()})
 
 
 def _acquire_employee_lock(employee_id: str) -> bool:
@@ -136,6 +211,238 @@ def _audit_safe(actor: str, action: str, details: dict) -> None:
         _audit(actor, action, details)
     except Exception:
         return
+
+
+def _normalize_department_name(value: object) -> str:
+    text = str(value or "").strip()
+    if not text:
+        raise HTTPException(status_code=400, detail="Department name is required.")
+    return text
+
+
+def _serialize_department_row(row: dict) -> dict:
+    return {
+        "id": int(row["id"]),
+        "name": row["name"],
+        "is_active": bool(row.get("is_active", True)),
+        "employee_count": int(row.get("employee_count") or 0),
+        "notice_count": int(row.get("notice_count") or 0),
+        "created_at": row.get("created_at").isoformat() if row.get("created_at") else None,
+        "updated_at": row.get("updated_at").isoformat() if row.get("updated_at") else None,
+    }
+
+
+def _get_department_by_name(cursor, name: str) -> dict | None:
+    cursor.execute(
+        """
+        SELECT id, name, is_active, created_at, updated_at
+        FROM departments
+        WHERE name = %s
+        LIMIT 1
+        """,
+        (name,),
+    )
+    return cursor.fetchone()
+
+
+def _get_department_by_id(cursor, department_id: int) -> dict | None:
+    cursor.execute(
+        """
+        SELECT id, name, is_active, created_at, updated_at
+        FROM departments
+        WHERE id = %s
+        LIMIT 1
+        """,
+        (department_id,),
+    )
+    return cursor.fetchone()
+
+
+def _list_department_rows(cursor, *, include_inactive: bool) -> list[dict]:
+    sql = """
+        SELECT
+          d.id,
+          d.name,
+          d.is_active,
+          d.created_at,
+          d.updated_at,
+          (
+            SELECT COUNT(*)
+            FROM employees e
+            WHERE e.department = d.name
+          ) AS employee_count,
+          (
+            SELECT COUNT(*)
+            FROM notices n
+            WHERE n.target_department = d.name
+          ) AS notice_count
+        FROM departments d
+    """
+    params: list[object] = []
+    if not include_inactive:
+        sql += " WHERE d.is_active = 1"
+    sql += " ORDER BY d.is_active DESC, d.name ASC"
+    cursor.execute(sql, tuple(params))
+    return cursor.fetchall() or []
+
+
+def _resolve_department_name(
+    cursor,
+    raw_value: object,
+    *,
+    require_active: bool,
+    allow_inactive_if_name: str | None = None,
+) -> str:
+    normalized_name = _normalize_department_name(raw_value)
+    department = _get_department_by_name(cursor, normalized_name)
+    if not department:
+        raise HTTPException(status_code=400, detail="Invalid department value.")
+    if not bool(department.get("is_active")):
+        current_name = str(allow_inactive_if_name or "").strip()
+        allow_inactive = not require_active or (current_name and current_name == department["name"])
+        if not allow_inactive:
+            raise HTTPException(status_code=400, detail="Selected department is inactive.")
+    return department["name"]
+
+
+def _invalidate_department_caches() -> None:
+    cache_invalidate("departments:")
+    cache_invalidate("employees:")
+
+
+def _normalize_permission_assignments(raw_permissions: list[object]) -> list[dict]:
+    normalized: list[dict] = []
+    seen: set[str] = set()
+
+    def _parse_permission_repr(text: str) -> tuple[str, list[str]]:
+        raw_text = str(text or "").strip()
+        if not raw_text:
+            return "", []
+        if raw_text in PERMISSION_KEYS:
+            return raw_text, []
+
+        key_match = _PERMISSION_KEY_PATTERN.search(raw_text)
+        parsed_key = key_match.group(1).strip() if key_match else raw_text
+
+        parsed_allowed: list[str] = []
+        allowed_match = _ALLOWED_DEPARTMENTS_PATTERN.search(raw_text)
+        if allowed_match:
+            try:
+                maybe_list = ast.literal_eval(allowed_match.group(1))
+                if isinstance(maybe_list, list):
+                    parsed_allowed = [str(value).strip() for value in maybe_list if str(value).strip()]
+            except Exception:
+                parsed_allowed = []
+        return parsed_key, parsed_allowed
+
+    for item in raw_permissions:
+        raw_allowed: list[object] | object = []
+        if isinstance(item, dict):
+            key, parsed_allowed = _parse_permission_repr(item.get("key"))
+            raw_allowed = item.get("allowed_departments") or parsed_allowed
+        elif hasattr(item, "model_dump"):
+            dumped = item.model_dump()
+            key, parsed_allowed = _parse_permission_repr(dumped.get("key"))
+            raw_allowed = dumped.get("allowed_departments") or parsed_allowed
+        elif hasattr(item, "key"):
+            key, parsed_allowed = _parse_permission_repr(getattr(item, "key", ""))
+            raw_allowed = getattr(item, "allowed_departments", None) or parsed_allowed
+        else:
+            key, raw_allowed = _parse_permission_repr(item)
+        if key and key not in PERMISSION_KEYS:
+            print(f"[permissions] skipping unknown permission entry in main.py: {key!r}")
+            continue
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        allowed_departments = [str(value).strip() for value in raw_allowed if str(value).strip()]
+        normalized.append(
+            {
+                "key": key,
+                "allowed_departments": list(dict.fromkeys(allowed_departments)),
+            }
+        )
+    return normalized
+
+
+def _resolve_department_scope_for_user(current_user: dict, *, permission_key: str) -> list[str] | None:
+    if current_user.get("role") == "admin":
+        print(
+            "[monthly-permission-debug]",
+            json.dumps(
+                {
+                    "path": "_resolve_department_scope_for_user",
+                    "current_user_id": current_user.get("id"),
+                    "current_user_permissions": current_user.get("permissions") or [],
+                    "requested_permission_key": permission_key,
+                    "resolved_permission_key": permission_key,
+                    "has_monthly_permission": has_permission(current_user, "can_view_monthly_attendance"),
+                    "allowed_departments": None,
+                    "branch": "admin_unrestricted",
+                },
+                default=str,
+            ),
+        )
+        return None
+    if permission_key not in SCOPED_PERMISSION_KEYS:
+        raise HTTPException(status_code=400, detail="Unsupported scoped permission key.")
+
+    resolved_permission_key = resolve_effective_permission_key(current_user, permission_key)
+    if not resolved_permission_key:
+        print(
+            "[monthly-permission-debug]",
+            json.dumps(
+                {
+                    "path": "_resolve_department_scope_for_user",
+                    "current_user_id": current_user.get("id"),
+                    "current_user_permissions": current_user.get("permissions") or [],
+                    "requested_permission_key": permission_key,
+                    "resolved_permission_key": None,
+                    "has_monthly_permission": has_permission(current_user, "can_view_monthly_attendance"),
+                    "allowed_departments": [],
+                    "branch": "403_missing_permission",
+                },
+                default=str,
+            ),
+        )
+        raise HTTPException(status_code=403, detail="Permission denied")
+
+    allowed_departments = get_allowed_departments(current_user, permission_key)
+    if not allowed_departments:
+        print(
+            "[monthly-permission-debug]",
+            json.dumps(
+                {
+                    "path": "_resolve_department_scope_for_user",
+                    "current_user_id": current_user.get("id"),
+                    "current_user_permissions": current_user.get("permissions") or [],
+                    "requested_permission_key": permission_key,
+                    "resolved_permission_key": resolved_permission_key,
+                    "has_monthly_permission": has_permission(current_user, "can_view_monthly_attendance"),
+                    "allowed_departments": allowed_departments,
+                    "branch": "403_empty_allowed_departments",
+                },
+                default=str,
+            ),
+        )
+        raise HTTPException(status_code=403, detail="This permission requires a linked employee department.")
+    print(
+        "[monthly-permission-debug]",
+        json.dumps(
+            {
+                "path": "_resolve_department_scope_for_user",
+                "current_user_id": current_user.get("id"),
+                "current_user_permissions": current_user.get("permissions") or [],
+                "requested_permission_key": permission_key,
+                "resolved_permission_key": resolved_permission_key,
+                "has_monthly_permission": has_permission(current_user, "can_view_monthly_attendance"),
+                "allowed_departments": allowed_departments,
+                "branch": "resolved",
+            },
+            default=str,
+        ),
+    )
+    return allowed_departments
 
 
 def _set_maintenance_mode(enabled: bool) -> None:
@@ -392,8 +699,17 @@ def _serialize_user(user: dict) -> dict:
         "email": user["email"],
         "role": user["role"],
         "employeeId": _employee_id_text(user.get("employee_id")) or None,
+        "department": user.get("department"),
+        "permissions": _normalize_permission_assignments(user.get("permissions") or []),
+        "photoUrl": user.get("photo_url"),
+        "forcePasswordChange": bool(user.get("force_password_change")),
         "createdAt": user["created_at"].isoformat() if user.get("created_at") else None,
     }
+
+
+def _generate_temporary_password(length: int = 12) -> str:
+    alphabet = "ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz23456789!@#$%?"
+    return "".join(secrets.choice(alphabet) for _ in range(length))
 
 
 def _employee_id_text(value: object) -> str:
@@ -406,6 +722,60 @@ def _employee_id_text(value: object) -> str:
         return str(int(text))
     except Exception:
         return text
+
+
+def _get_linked_user_for_employee(cursor, employee_id: str | int, employee_email: str | None = None) -> dict | None:
+    params: list[object] = [employee_id]
+    query = [
+        "SELECT id, name, email, password_hash, role, employee_id, force_password_change, created_at",
+        "FROM users",
+        "WHERE employee_id=%s",
+    ]
+    if employee_email:
+        query.append("OR LOWER(email)=LOWER(%s)")
+        params.append(employee_email)
+    query.append("ORDER BY employee_id=%s DESC, id ASC LIMIT 1")
+    params.append(employee_id)
+    cursor.execute("\n".join(query), tuple(params))
+    return cursor.fetchone()
+
+
+def _get_user_for_login(cursor, email: str) -> dict | None:
+    normalized_email = str(email).strip().lower()
+    if not normalized_email:
+        return None
+
+    cursor.execute(
+        """
+        SELECT u.id, u.name, u.email, u.password_hash, u.role, u.employee_id, u.force_password_change, u.created_at, e.photo_url, e.department
+        FROM users u
+        LEFT JOIN employees e ON e.id = u.employee_id
+        WHERE LOWER(u.email)=LOWER(%s)
+           OR LOWER(e.email)=LOWER(%s)
+        LIMIT 1
+        """,
+        (normalized_email, normalized_email),
+    )
+    user = cursor.fetchone()
+    if user:
+        user["permissions"] = _load_permissions(cursor, int(user["id"]))
+        return user
+
+    cursor.execute(
+        """
+        SELECT u.id, u.name, u.email, u.password_hash, u.role, u.employee_id, u.force_password_change, u.created_at, e.photo_url
+        FROM employees e
+        JOIN users u ON u.employee_id = e.id
+        WHERE LOWER(e.email)=LOWER(%s)
+        ORDER BY u.id ASC
+        LIMIT 1
+        """,
+        (normalized_email,),
+    )
+    user = cursor.fetchone()
+    if user:
+        user["permissions"] = _load_permissions(cursor, int(user["id"]))
+    return user
 
 
 def _assert_employee_link_available(cursor, *, employee_id: int | None, current_user_id: int | None = None) -> None:
@@ -507,7 +877,13 @@ def _normalize_shift_time(value: object) -> str:
 def _get_app_settings(cursor) -> dict:
     cursor.execute(
         """
-        SELECT shift_start_time, grace_period_mins, fine_per_minute_pkr, updated_at
+        SELECT
+          shift_start_time,
+          grace_period_mins,
+          late_fine_pkr,
+          absent_fine_pkr,
+          not_marked_fine_pkr,
+          updated_at
         FROM app_settings
         WHERE id=1
         LIMIT 1
@@ -517,14 +893,22 @@ def _get_app_settings(cursor) -> dict:
     if not row:
         cursor.execute(
             """
-            INSERT INTO app_settings (id, shift_start_time, grace_period_mins, fine_per_minute_pkr)
-            VALUES (1, '09:00:00', 15, 0.00)
+            INSERT INTO app_settings (
+              id, shift_start_time, grace_period_mins, fine_per_minute_pkr, late_fine_pkr, absent_fine_pkr, not_marked_fine_pkr
+            )
+            VALUES (1, '09:00:00', 15, 0.00, 0.00, 0.00, 0.00)
             ON DUPLICATE KEY UPDATE id=id
             """
         )
         cursor.execute(
             """
-            SELECT shift_start_time, grace_period_mins, fine_per_minute_pkr, updated_at
+            SELECT
+              shift_start_time,
+              grace_period_mins,
+              late_fine_pkr,
+              absent_fine_pkr,
+              not_marked_fine_pkr,
+              updated_at
             FROM app_settings
             WHERE id=1
             LIMIT 1
@@ -533,11 +917,15 @@ def _get_app_settings(cursor) -> dict:
         row = cursor.fetchone() or {}
     shift_start = _normalize_shift_time(row.get("shift_start_time"))
     grace = int(row.get("grace_period_mins") or 0)
-    fine_rate = float(row.get("fine_per_minute_pkr") or 0)
+    late_fine = round(float(row.get("late_fine_pkr") or 0), 2)
+    absent_fine = round(float(row.get("absent_fine_pkr") or 0), 2)
+    not_marked_fine = round(float(row.get("not_marked_fine_pkr") or 0), 2)
     return {
         "shift_start_time": shift_start,
         "grace_period_mins": grace,
-        "fine_per_minute_pkr": fine_rate,
+        "late_fine_pkr": late_fine,
+        "absent_fine_pkr": absent_fine,
+        "not_marked_fine_pkr": not_marked_fine,
         "updated_at": row.get("updated_at"),
     }
 
@@ -554,14 +942,167 @@ def _compute_fine(checkin_time: str | None, settings: dict) -> tuple[int, float]
         return 0, 0.0
     shift_raw = _normalize_shift_time(shift_setting)
     grace = int(settings.get("grace_period_mins") if settings.get("grace_period_mins") is not None else 15)
-    fine_rate = float(settings.get("fine_per_minute_pkr") or 0)
+    late_fine = round(float(settings.get("late_fine_pkr") or 0), 2)
 
     checkin_dt = datetime.strptime(checkin_raw[:5], "%H:%M")
     shift_dt = datetime.strptime(shift_raw[:5], "%H:%M")
     diff_mins = int((checkin_dt - shift_dt).total_seconds() // 60)
     late_minutes = max(0, diff_mins - max(0, grace))
-    fine_amount = round(late_minutes * max(0.0, fine_rate), 2)
+    fine_amount = late_fine if late_minutes > 0 else 0.0
     return late_minutes, fine_amount
+
+
+def _normalize_optional_checkin_time(value: object) -> str | None:
+    raw = str(value or "").strip()
+    if not raw:
+        return None
+    fmt = "%H:%M:%S" if raw.count(":") == 2 else "%H:%M"
+    try:
+        parsed = datetime.strptime(raw, fmt)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail="checkin_time must be HH:MM or HH:MM:SS") from exc
+    return parsed.strftime("%H:%M")
+
+
+def _normalize_attendance_update(
+    *,
+    attendance_date: date,
+    employee_settings: dict,
+    status_value: str,
+    checkin_time_value: str | None,
+) -> tuple[str, str | None, int, float]:
+    requested_status = str(status_value or "").strip().title()
+    if requested_status not in {"Present", "Late", "Absent"}:
+        raise HTTPException(status_code=400, detail="status must be Present, Late, or Absent")
+
+    normalized_checkin_time = _normalize_optional_checkin_time(checkin_time_value)
+
+    if requested_status == "Absent":
+        return "Absent", None, 0, round(float(employee_settings.get("absent_fine_pkr") or 0), 2)
+
+    if not normalized_checkin_time:
+        raise HTTPException(status_code=400, detail="checkin_time is required when status is Present or Late")
+
+    resolved_status, late_minutes, fine_amount = _resolve_attendance_outcome(
+        attendance_date,
+        normalized_checkin_time,
+        employee_settings,
+    )
+
+    if resolved_status not in {"Present", "Late"}:
+        raise HTTPException(status_code=400, detail="Attendance on off/pre-join days cannot be edited to Present/Late.")
+
+    return resolved_status, normalized_checkin_time, late_minutes, fine_amount
+
+
+def _serialize_admin_attendance_item(row: dict, *, employee_settings: dict | None = None) -> dict:
+    settings = employee_settings or {
+        "shift_start_time": row.get("e_shift_start_time"),
+        "grace_period_mins": row.get("e_grace_period_mins"),
+        "late_fine_pkr": row.get("e_late_fine_pkr"),
+    }
+    late_minutes, _ = _compute_fine(row.get("checkin_time"), settings)
+    return {
+        "id": row["id"],
+        "employee_id": str(row["employee_id"]),
+        "date": str(row["date"]),
+        "checkin_time": row.get("checkin_time"),
+        "status": row["status"],
+        "fine_amount": float(row.get("fine_amount") or 0),
+        "late_minutes": late_minutes if row.get("status") != "Absent" else 0,
+        "confidence": float(row.get("confidence") or 0),
+        "source": row.get("source"),
+        "note": row.get("note"),
+        "evidence_photo_url": row.get("evidence_photo_url"),
+        "created_at": row["created_at"].isoformat() if row.get("created_at") else None,
+        "employee": {
+            "id": str(row["e_id"]),
+            "name": row["e_name"],
+            "email": row["e_email"],
+            "department": row["e_department"],
+            "role": row["e_role"],
+            "is_active": bool(row["e_is_active"]),
+            "photo_url": row.get("e_photo_url"),
+        },
+    }
+
+
+def _normalize_off_days(value: object) -> list[str]:
+    parsed = value
+    if value is None:
+        return []
+    if isinstance(value, str):
+        raw = value.strip()
+        if not raw:
+            return []
+        try:
+            parsed = json.loads(raw)
+        except json.JSONDecodeError:
+            parsed = [part.strip() for part in raw.split(",") if part.strip()]
+    if not isinstance(parsed, (list, tuple, set)):
+        return []
+
+    normalized: list[str] = []
+    seen: set[str] = set()
+    for item in parsed:
+        day = str(item or "").strip().lower()
+        if day in VALID_OFF_DAYS and day not in seen:
+            normalized.append(day)
+            seen.add(day)
+    return normalized
+
+
+def _serialize_off_days(value: object) -> str | None:
+    normalized = _normalize_off_days(value)
+    return json.dumps(normalized) if normalized else None
+
+
+def _weekday_name(cursor_day: date) -> str:
+    return WEEKDAY_BY_INDEX[cursor_day.weekday()]
+
+
+def _is_employee_off_day(cursor_day: date, settings: dict) -> bool:
+    return _weekday_name(cursor_day) in _normalize_off_days(settings.get("off_days_json"))
+
+
+def _employee_join_date(settings: dict) -> date | None:
+    raw = settings.get("created_at")
+    if raw is None:
+        return None
+    if isinstance(raw, date) and not isinstance(raw, datetime):
+        return raw
+    if isinstance(raw, datetime):
+        return raw.date()
+    text = str(raw).strip()
+    if not text:
+        return None
+    try:
+        return datetime.fromisoformat(text.replace("Z", "+00:00")).date()
+    except ValueError:
+        try:
+            return datetime.strptime(text[:10], "%Y-%m-%d").date()
+        except ValueError:
+            return None
+
+
+def _resolve_attendance_outcome(cursor_day: date, checkin_time: str | None, settings: dict) -> tuple[str, int, float]:
+    if _is_employee_off_day(cursor_day, settings):
+        return "Off", 0, 0.0
+    late_minutes, fine_amount = _compute_fine(checkin_time, settings)
+    return ("Late" if late_minutes > 0 else "Present"), late_minutes, fine_amount
+
+
+def _derive_missing_day(cursor_day: date, today: date, settings: dict) -> tuple[str, float]:
+    join_date = _employee_join_date(settings)
+    if join_date and cursor_day < join_date:
+        return "pre_join", 0.0
+    if _is_employee_off_day(cursor_day, settings):
+        return "off", 0.0
+    if cursor_day < today:
+        return "absent", round(float(settings.get("absent_fine_pkr") or 0), 2)
+    if cursor_day == today:
+        return "not_marked", round(float(settings.get("not_marked_fine_pkr") or 0), 2)
+    return "not_marked", 0.0
 
 
 def _decode_base64_image_bytes(image_base64: str) -> bytes:
@@ -1152,16 +1693,7 @@ def startup_event() -> None:
 @api.post("/auth/login")
 def login(payload: LoginRequest):
     with get_conn_cursor(dictionary=True) as (_, cursor):
-        cursor.execute(
-            """
-            SELECT id, name, email, password_hash, role, employee_id, created_at
-            FROM users
-            WHERE email=%s
-            LIMIT 1
-            """,
-            (payload.email,),
-        )
-        user = cursor.fetchone()
+        user = _get_user_for_login(cursor, str(payload.email))
 
     if not user or not verify_password(payload.password, user["password_hash"]):
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid email or password")
@@ -1198,7 +1730,10 @@ def change_password(payload: ChangePasswordRequest, current_user: dict = Depends
         if not verify_password(payload.oldPassword, row["password_hash"]):
             raise HTTPException(status_code=400, detail="Current password is incorrect")
         new_hash = hash_password(payload.newPassword)
-        cursor.execute("UPDATE users SET password_hash=%s WHERE id=%s", (new_hash, current_user["id"]))
+        cursor.execute(
+            "UPDATE users SET password_hash=%s, force_password_change=0 WHERE id=%s",
+            (new_hash, current_user["id"]),
+        )
 
     _audit(current_user["email"], "password_change", {"userId": current_user["id"]})
     return {"ok": True}
@@ -1548,7 +2083,7 @@ def checkin_complete(
     with get_conn_cursor(dictionary=True) as (_, cursor):
         cursor.execute(
             """
-            SELECT shift_start_time, grace_period_mins, fine_per_minute_pkr
+            SELECT shift_start_time, grace_period_mins, late_fine_pkr, absent_fine_pkr, not_marked_fine_pkr, off_days_json, created_at
             FROM employees
             WHERE id=%s
             LIMIT 1
@@ -1562,7 +2097,7 @@ def checkin_complete(
         )
         existing = cursor.fetchone()
         if existing:
-            existing_late_minutes, _ = _compute_fine(existing.get("checkin_time"), employee_settings)
+            _, existing_late_minutes, _ = _resolve_attendance_outcome(now_dt.date(), existing.get("checkin_time"), employee_settings)
             _checkin_session_update_db(payload.session_id, state="completed", notes="Already marked today")
             return {
                 "ok": True,
@@ -1581,8 +2116,7 @@ def checkin_complete(
                 },
             }
 
-        late_minutes, fine_amount = _compute_fine(checkin_time, employee_settings)
-        status_label = "Late" if late_minutes > 0 else "Present"
+        status_label, late_minutes, fine_amount = _resolve_attendance_outcome(now_dt.date(), checkin_time, employee_settings)
         att_id = str(uuid.uuid4())
         cursor.execute(
             """
@@ -1662,36 +2196,318 @@ def _validate_notice_window(starts_at: datetime | None, ends_at: datetime | None
         raise HTTPException(status_code=400, detail="starts_at must be less than or equal to ends_at")
 
 
+def _clean_notice_target(value: str | None) -> str | None:
+    text = str(value or "").strip()
+    return text or None
+
+
+def _normalize_notice_auth_role(value: str | None) -> str:
+    role = str(value or "").strip().lower()
+    return "admin" if role == "admin" else "user"
+
+
+def _normalize_notice_audience(value: str | None) -> str:
+    audience = str(value or "").strip().lower().replace("-", "_").replace(" ", "_")
+    if audience in {"", "all", "all_users", "everyone", "everyone_users"}:
+        return "all"
+    if audience in {"admins_only", "admin_only", "admins", "admin"}:
+        return "admins_only"
+    if audience in {"users_only", "user_only", "users", "normal_users", "employees", "all_employees"}:
+        return "users_only"
+    return audience or "all"
+
+
+def _get_notice_user_profile(cursor, current_user: dict) -> dict:
+    employee_id = _resolve_employee_id_for_current_user(current_user)
+    if employee_id:
+        cursor.execute(
+            "SELECT department, role FROM employees WHERE id=%s LIMIT 1",
+            (employee_id,),
+        )
+        row = cursor.fetchone() or {}
+        return {
+            "auth_role": _normalize_notice_auth_role(current_user.get("role")),
+            "department": _clean_notice_target(row.get("department")),
+            "employee_role": _clean_notice_target(row.get("role")),
+        }
+    return {
+        "auth_role": _normalize_notice_auth_role(current_user.get("role")),
+        "department": None,
+        "employee_role": None,
+    }
+
+
+def _notice_matches_user(notice: dict, *, auth_role: str, department: str | None, employee_role: str | None) -> bool:
+    audience = _normalize_notice_audience(notice.get("target_audience"))
+    normalized_auth_role = _normalize_notice_auth_role(auth_role)
+    if audience == "admins_only" and normalized_auth_role != "admin":
+        return False
+    if audience == "users_only" and normalized_auth_role != "user":
+        return False
+
+    target_department = _clean_notice_target(notice.get("target_department"))
+    if target_department and (not department or target_department.lower() != department.lower()):
+        return False
+
+    target_role = _clean_notice_target(notice.get("target_role"))
+    if target_role and (not employee_role or target_role.lower() != employee_role.lower()):
+        return False
+
+    return True
+
+
+def _notice_is_currently_active(notice: dict, now: datetime) -> bool:
+    starts_at = notice.get("starts_at")
+    ends_at = notice.get("ends_at")
+    starts_ok = not starts_at or datetime.fromisoformat(str(starts_at)) <= now if isinstance(starts_at, str) else not starts_at or starts_at <= now
+    ends_ok = not ends_at or datetime.fromisoformat(str(ends_at)) >= now if isinstance(ends_at, str) else not ends_at or ends_at >= now
+    return starts_ok and ends_ok
+
+
+def _load_notice_user_states(cursor, user_id: int) -> dict[int, dict]:
+    cursor.execute(
+        """
+        SELECT notice_id, seen_at, dismissed_at, acknowledged_at
+        FROM notice_user_states
+        WHERE user_id=%s
+        """,
+        (user_id,),
+    )
+    rows = cursor.fetchall() or []
+    return {int(row["notice_id"]): row for row in rows}
+
+
+def _upsert_notice_user_state(
+    cursor,
+    *,
+    notice_id: int,
+    user_id: int,
+    mark_seen: bool = False,
+    mark_dismissed: bool = False,
+    mark_acknowledged: bool = False,
+) -> None:
+    updates: list[str] = []
+    params: list[object] = [notice_id, user_id]
+    if mark_seen:
+      updates.append("seen_at=COALESCE(seen_at, CURRENT_TIMESTAMP)")
+    if mark_dismissed:
+      updates.append("dismissed_at=COALESCE(dismissed_at, CURRENT_TIMESTAMP)")
+    if mark_acknowledged:
+      updates.append("acknowledged_at=COALESCE(acknowledged_at, CURRENT_TIMESTAMP)")
+    if not updates:
+      return
+    update_sql = ", ".join(updates) + ", updated_at=CURRENT_TIMESTAMP"
+    cursor.execute(
+        f"""
+        INSERT INTO notice_user_states (notice_id, user_id, seen_at, dismissed_at, acknowledged_at)
+        VALUES (
+          %s,
+          %s,
+          { 'CURRENT_TIMESTAMP' if mark_seen else 'NULL' },
+          { 'CURRENT_TIMESTAMP' if mark_dismissed else 'NULL' },
+          { 'CURRENT_TIMESTAMP' if mark_acknowledged else 'NULL' }
+        )
+        ON DUPLICATE KEY UPDATE {update_sql}
+        """,
+        tuple(params),
+    )
+
+
+@api.get("/departments")
+def list_departments(
+    include_inactive: bool = Query(default=False),
+    _: dict = Depends(get_current_user),
+):
+    cache_key = f"departments:list:user:{1 if include_inactive else 0}"
+    cached = cache_get(cache_key)
+    if cached is not None:
+        return cached
+
+    with get_conn_cursor(dictionary=True) as (_, cursor):
+        rows = _list_department_rows(cursor, include_inactive=include_inactive)
+
+    result = {"ok": True, "departments": [_serialize_department_row(row) for row in rows]}
+    cache_set(cache_key, result, ttl_seconds=120)
+    return result
+
+
+@api.get("/admin/departments")
+def admin_list_departments(
+    include_inactive: bool = Query(default=True),
+    _: dict = Depends(require_admin),
+):
+    cache_key = f"departments:list:admin:{1 if include_inactive else 0}"
+    cached = cache_get(cache_key)
+    if cached is not None:
+        return cached
+
+    with get_conn_cursor(dictionary=True) as (_, cursor):
+        rows = _list_department_rows(cursor, include_inactive=include_inactive)
+
+    result = {"ok": True, "departments": [_serialize_department_row(row) for row in rows]}
+    cache_set(cache_key, result, ttl_seconds=120)
+    return result
+
+
+@api.post("/admin/departments")
+def admin_create_department(payload: DepartmentCreateRequest, current_user: dict = Depends(require_admin)):
+    normalized_name = _normalize_department_name(payload.name)
+    with get_conn_cursor(dictionary=True) as (_, cursor):
+        existing = _get_department_by_name(cursor, normalized_name)
+        if existing:
+            raise HTTPException(status_code=400, detail="Department already exists.")
+
+        cursor.execute(
+            """
+            INSERT INTO departments (name, is_active)
+            VALUES (%s, %s)
+            """,
+            (normalized_name, 1 if payload.is_active else 0),
+        )
+        department_id = int(cursor.lastrowid)
+        rows = _list_department_rows(cursor, include_inactive=True)
+        created = next((row for row in rows if int(row["id"]) == department_id), None)
+
+    _invalidate_department_caches()
+    _audit(
+        current_user["email"],
+        "department_create",
+        {"departmentId": department_id, "name": normalized_name, "isActive": bool(payload.is_active)},
+    )
+    return {
+        "ok": True,
+        "department": _serialize_department_row(
+            created or {"id": department_id, "name": normalized_name, "is_active": payload.is_active}
+        ),
+    }
+
+
+@api.put("/admin/departments/{department_id}")
+def admin_update_department(
+    department_id: int,
+    payload: DepartmentUpdateRequest,
+    current_user: dict = Depends(require_admin),
+):
+    normalized_name = _normalize_department_name(payload.name)
+    with get_conn_cursor(dictionary=True) as (_, cursor):
+        existing = _get_department_by_id(cursor, department_id)
+        if not existing:
+            raise HTTPException(status_code=404, detail="Department not found.")
+
+        duplicate = _get_department_by_name(cursor, normalized_name)
+        if duplicate and int(duplicate["id"]) != department_id:
+            raise HTTPException(status_code=400, detail="Department name already exists.")
+
+        previous_name = existing["name"]
+        cursor.execute(
+            """
+            UPDATE departments
+            SET name = %s, is_active = %s
+            WHERE id = %s
+            """,
+            (normalized_name, 1 if payload.is_active else 0, department_id),
+        )
+
+        if previous_name != normalized_name:
+            cursor.execute("UPDATE employees SET department = %s WHERE department = %s", (normalized_name, previous_name))
+            cursor.execute("UPDATE notices SET target_department = %s WHERE target_department = %s", (normalized_name, previous_name))
+
+        rows = _list_department_rows(cursor, include_inactive=True)
+        updated = next((row for row in rows if int(row["id"]) == department_id), None)
+
+    _invalidate_department_caches()
+    cache_invalidate("notices:")
+    _audit(
+        current_user["email"],
+        "department_update",
+        {
+            "departmentId": department_id,
+            "oldName": previous_name,
+            "name": normalized_name,
+            "isActive": bool(payload.is_active),
+        },
+    )
+    return {
+        "ok": True,
+        "department": _serialize_department_row(
+            updated or {"id": department_id, "name": normalized_name, "is_active": payload.is_active}
+        ),
+    }
+
+
+@api.delete("/admin/departments/{department_id}")
+def admin_delete_department(department_id: int, current_user: dict = Depends(require_admin)):
+    with get_conn_cursor(dictionary=True) as (_, cursor):
+        rows = _list_department_rows(cursor, include_inactive=True)
+        department = next((row for row in rows if int(row["id"]) == department_id), None)
+        if not department:
+            raise HTTPException(status_code=404, detail="Department not found.")
+        if int(department.get("employee_count") or 0) > 0 or int(department.get("notice_count") or 0) > 0:
+            raise HTTPException(status_code=400, detail="Department is in use. Deactivate it instead of deleting.")
+
+        cursor.execute("DELETE FROM departments WHERE id = %s", (department_id,))
+
+    _invalidate_department_caches()
+    _audit(current_user["email"], "department_delete", {"departmentId": department_id, "name": department["name"]})
+    return {"ok": True}
+
+
 @api.get("/notices")
-def get_notices(_: dict = Depends(get_current_user)):
+def get_notices(current_user: dict = Depends(get_current_user)):
     now = datetime.now()
     with get_conn_cursor(dictionary=True) as (_, cursor):
-        notices = list_public_notices(cursor, now)
+        profile = _get_notice_user_profile(cursor, current_user)
+        notices = [
+            notice
+            for notice in list_public_notices(cursor, now)
+            if _notice_matches_user(
+                notice,
+                auth_role=profile["auth_role"],
+                department=profile["department"],
+                employee_role=profile["employee_role"],
+            )
+        ]
     return {"ok": True, "notices": notices}
 
 
 @api.get("/admin/notices")
-def get_admin_notices(_: dict = Depends(require_admin)):
+def get_admin_notices(_: dict = Depends(require_permission("can_manage_notices"))):
     with get_conn_cursor(dictionary=True) as (_, cursor):
         notices = list_admin_notices(cursor)
     return {"ok": True, "notices": notices}
 
 
 @api.post("/admin/notices")
-def create_admin_notice(payload: NoticeCreateRequest, current_user: dict = Depends(require_admin)):
+def create_admin_notice(payload: NoticeCreateRequest, current_user: dict = Depends(require_permission("can_manage_notices"))):
     if not payload.title.strip() or not payload.body.strip():
         raise HTTPException(status_code=400, detail="title and body are required")
     _validate_notice_window(payload.starts_at, payload.ends_at)
     with get_conn_cursor(dictionary=True) as (_, cursor):
+        target_department = (
+            _resolve_department_name(cursor, payload.target_department, require_active=False)
+            if payload.target_department
+            else None
+        )
         notice_id = insert_notice(
             cursor,
             title=payload.title.strip(),
             body=payload.body.strip(),
             priority=payload.priority,
             is_active=payload.is_active,
+            is_sticky=payload.is_sticky,
+            show_on_login=payload.show_on_login,
+            show_on_refresh=payload.show_on_refresh,
+            repeat_every_login=payload.repeat_every_login,
+            is_dismissible=payload.is_dismissible,
+            requires_acknowledgement=payload.requires_acknowledgement,
+            target_audience=payload.target_audience,
+            target_department=target_department,
+            target_role=_clean_notice_target(payload.target_role),
             starts_at=payload.starts_at,
             ends_at=payload.ends_at,
             created_by_user_id=int(current_user["id"]),
+            closed_at=None if payload.is_active else datetime.now(),
+            closed_by_user_id=None if payload.is_active else int(current_user["id"]),
         )
         row = get_notice_by_id(cursor, notice_id)
     if not row:
@@ -1701,7 +2517,7 @@ def create_admin_notice(payload: NoticeCreateRequest, current_user: dict = Depen
 
 
 @api.put("/admin/notices/{notice_id}")
-def update_admin_notice(notice_id: int, payload: NoticeUpdateRequest, current_user: dict = Depends(require_admin)):
+def update_admin_notice(notice_id: int, payload: NoticeUpdateRequest, current_user: dict = Depends(require_permission("can_manage_notices"))):
     if not payload.title.strip() or not payload.body.strip():
         raise HTTPException(status_code=400, detail="title and body are required")
     _validate_notice_window(payload.starts_at, payload.ends_at)
@@ -1709,6 +2525,11 @@ def update_admin_notice(notice_id: int, payload: NoticeUpdateRequest, current_us
         existing = get_notice_by_id(cursor, notice_id)
         if not existing:
             raise HTTPException(status_code=404, detail="Notice not found")
+        target_department = (
+            _resolve_department_name(cursor, payload.target_department, require_active=False)
+            if payload.target_department
+            else None
+        )
         update_notice(
             cursor,
             notice_id,
@@ -1716,8 +2537,19 @@ def update_admin_notice(notice_id: int, payload: NoticeUpdateRequest, current_us
             body=payload.body.strip(),
             priority=payload.priority,
             is_active=payload.is_active,
+            is_sticky=payload.is_sticky,
+            show_on_login=payload.show_on_login,
+            show_on_refresh=payload.show_on_refresh,
+            repeat_every_login=payload.repeat_every_login,
+            is_dismissible=payload.is_dismissible,
+            requires_acknowledgement=payload.requires_acknowledgement,
+            target_audience=payload.target_audience,
+            target_department=target_department,
+            target_role=_clean_notice_target(payload.target_role),
             starts_at=payload.starts_at,
             ends_at=payload.ends_at,
+            closed_at=None if payload.is_active else datetime.now(),
+            closed_by_user_id=None if payload.is_active else int(current_user["id"]),
         )
         row = get_notice_by_id(cursor, notice_id)
     _audit(current_user["email"], "notice_update", {"noticeId": notice_id})
@@ -1725,13 +2557,166 @@ def update_admin_notice(notice_id: int, payload: NoticeUpdateRequest, current_us
 
 
 @api.delete("/admin/notices/{notice_id}")
-def delete_admin_notice(notice_id: int, current_user: dict = Depends(require_admin)):
+def delete_admin_notice(notice_id: int, current_user: dict = Depends(require_permission("can_manage_notices"))):
     with get_conn_cursor(dictionary=True) as (_, cursor):
         existing = get_notice_by_id(cursor, notice_id)
         if not existing:
             raise HTTPException(status_code=404, detail="Notice not found")
         delete_notice(cursor, notice_id)
     _audit(current_user["email"], "notice_delete", {"noticeId": notice_id})
+    return {"ok": True}
+
+
+@api.get("/notices/login-pending")
+def get_login_pending_notices(
+    trigger: str = Query("login"),
+    current_user: dict = Depends(get_current_user),
+):
+    now = datetime.now()
+    normalized_trigger = str(trigger or "login").strip().lower()
+    if normalized_trigger not in {"login", "refresh"}:
+        raise HTTPException(status_code=400, detail="trigger must be login or refresh")
+    with get_conn_cursor(dictionary=True) as (_, cursor):
+        profile = _get_notice_user_profile(cursor, current_user)
+        states = _load_notice_user_states(cursor, int(current_user["id"]))
+        candidate_notices = list_public_notices(cursor, now)
+        notices = []
+        debug_rows: list[dict] = []
+        for notice in candidate_notices:
+            notice_id = int(notice["id"])
+            debug_entry = {
+                "id": notice_id,
+                "active": bool(notice.get("is_active")),
+                "show_on_login": bool(notice.get("show_on_login")),
+                "show_on_refresh": bool(notice.get("show_on_refresh")),
+                "repeat_every_login": bool(notice.get("repeat_every_login")),
+                "is_dismissible": bool(notice.get("is_dismissible")),
+                "requires_acknowledgement": bool(notice.get("requires_acknowledgement")),
+                "target_audience": notice.get("target_audience"),
+                "normalized_target_audience": _normalize_notice_audience(notice.get("target_audience")),
+                "target_department": notice.get("target_department"),
+                "target_role": notice.get("target_role"),
+                "starts_at": notice.get("starts_at").isoformat() if hasattr(notice.get("starts_at"), "isoformat") else notice.get("starts_at"),
+                "ends_at": notice.get("ends_at").isoformat() if hasattr(notice.get("ends_at"), "isoformat") else notice.get("ends_at"),
+                "trigger": normalized_trigger,
+                "decision": "excluded",
+                "reason": "",
+            }
+            if normalized_trigger == "login" and not notice.get("show_on_login"):
+                debug_entry["reason"] = "show_on_login_disabled"
+                debug_rows.append(debug_entry)
+                continue
+            if normalized_trigger == "refresh" and not notice.get("show_on_refresh"):
+                debug_entry["reason"] = "show_on_refresh_disabled"
+                debug_rows.append(debug_entry)
+                continue
+            if not _notice_is_currently_active(notice, now):
+                debug_entry["reason"] = "outside_active_window"
+                debug_rows.append(debug_entry)
+                continue
+            if not _notice_matches_user(
+                notice,
+                auth_role=profile["auth_role"],
+                department=profile["department"],
+                employee_role=profile["employee_role"],
+            ):
+                debug_entry["reason"] = "target_mismatch"
+                debug_rows.append(debug_entry)
+                continue
+            state = states.get(int(notice["id"]), {})
+            if normalized_trigger == "refresh":
+                debug_entry["decision"] = "included"
+                debug_entry["reason"] = "refresh_trigger"
+                debug_rows.append(debug_entry)
+                notices.append(notice)
+                continue
+            if notice.get("repeat_every_login"):
+                debug_entry["decision"] = "included"
+                debug_entry["reason"] = "repeat_every_login"
+                debug_rows.append(debug_entry)
+                notices.append(notice)
+                continue
+            if notice.get("requires_acknowledgement") and not state.get("acknowledged_at"):
+                debug_entry["decision"] = "included"
+                debug_entry["reason"] = "awaiting_acknowledgement"
+                debug_rows.append(debug_entry)
+                notices.append(notice)
+                continue
+            if notice.get("is_dismissible") and not state.get("dismissed_at"):
+                debug_entry["decision"] = "included"
+                debug_entry["reason"] = "dismissible_not_dismissed"
+                debug_rows.append(debug_entry)
+                notices.append(notice)
+                continue
+            if not notice.get("requires_acknowledgement") and not notice.get("is_dismissible") and not state.get("seen_at"):
+                debug_entry["decision"] = "included"
+                debug_entry["reason"] = "not_seen_yet"
+                debug_rows.append(debug_entry)
+                notices.append(notice)
+                continue
+            debug_entry["reason"] = "already_completed_for_user"
+            debug_rows.append(debug_entry)
+        print(
+            "[notices.login_pending]",
+            {
+                "user_id": int(current_user["id"]),
+                "trigger": normalized_trigger,
+                "auth_role": profile["auth_role"],
+                "department": profile["department"],
+                "employee_role": profile["employee_role"],
+                "candidate_notice_ids": [int(notice["id"]) for notice in candidate_notices],
+                "notice_ids": [int(notice["id"]) for notice in notices],
+                "evaluated": debug_rows,
+            },
+        )
+        return {"ok": True, "notices": notices}
+
+
+def _get_accessible_notice(cursor, notice_id: int, current_user: dict, *, must_be_popup_notice: bool = False) -> dict:
+    row = get_notice_by_id(cursor, notice_id)
+    if not row:
+        raise HTTPException(status_code=404, detail="Notice not found")
+    notice = serialize_notice_row(row)
+    profile = _get_notice_user_profile(cursor, current_user)
+    if not notice.get("is_active") or notice.get("closed_at"):
+        raise HTTPException(status_code=404, detail="Notice not available")
+    if must_be_popup_notice and not notice.get("show_on_login") and not notice.get("show_on_refresh"):
+        raise HTTPException(status_code=400, detail="Notice is not configured for popup display")
+    if not _notice_matches_user(
+        notice,
+        auth_role=profile["auth_role"],
+        department=profile["department"],
+        employee_role=profile["employee_role"],
+    ):
+        raise HTTPException(status_code=403, detail="Notice not available for your account")
+    return notice
+
+
+@api.post("/notices/{notice_id}/seen")
+def mark_notice_seen(notice_id: int, current_user: dict = Depends(get_current_user)):
+    with get_conn_cursor(dictionary=True) as (_, cursor):
+        _get_accessible_notice(cursor, notice_id, current_user, must_be_popup_notice=True)
+        _upsert_notice_user_state(cursor, notice_id=notice_id, user_id=int(current_user["id"]), mark_seen=True)
+    return {"ok": True}
+
+
+@api.post("/notices/{notice_id}/dismiss")
+def dismiss_notice(notice_id: int, current_user: dict = Depends(get_current_user)):
+    with get_conn_cursor(dictionary=True) as (_, cursor):
+        notice = _get_accessible_notice(cursor, notice_id, current_user, must_be_popup_notice=True)
+        if not notice.get("is_dismissible") and not notice.get("repeat_every_login") and not notice.get("show_on_refresh"):
+            raise HTTPException(status_code=400, detail="This notice cannot be dismissed")
+        _upsert_notice_user_state(cursor, notice_id=notice_id, user_id=int(current_user["id"]), mark_seen=True, mark_dismissed=True)
+    return {"ok": True}
+
+
+@api.post("/notices/{notice_id}/acknowledge")
+def acknowledge_notice(notice_id: int, current_user: dict = Depends(get_current_user)):
+    with get_conn_cursor(dictionary=True) as (_, cursor):
+        notice = _get_accessible_notice(cursor, notice_id, current_user, must_be_popup_notice=True)
+        if not notice.get("requires_acknowledgement"):
+            raise HTTPException(status_code=400, detail="This notice does not require acknowledgement")
+        _upsert_notice_user_state(cursor, notice_id=notice_id, user_id=int(current_user["id"]), mark_seen=True, mark_acknowledged=True)
     return {"ok": True}
 
 
@@ -1744,7 +2729,9 @@ def get_admin_settings(_: dict = Depends(require_admin)):
         "settings": {
             "shift_start_time": settings["shift_start_time"],
             "grace_period_mins": settings["grace_period_mins"],
-            "fine_per_minute_pkr": settings["fine_per_minute_pkr"],
+            "late_fine_pkr": settings["late_fine_pkr"],
+            "absent_fine_pkr": settings["absent_fine_pkr"],
+            "not_marked_fine_pkr": settings["not_marked_fine_pkr"],
             "updated_at": settings["updated_at"].isoformat() if settings.get("updated_at") else None,
         },
     }
@@ -1758,21 +2745,27 @@ def update_admin_settings(payload: AppSettingsUpdateRequest, current_user: dict 
         raise HTTPException(status_code=400, detail="shift_start_time must be HH:MM or HH:MM:SS") from exc
 
     grace = int(payload.grace_period_mins)
-    fine_rate = round(float(payload.fine_per_minute_pkr), 2)
+    late_fine = round(float(payload.late_fine_pkr), 2)
+    absent_fine = round(float(payload.absent_fine_pkr), 2)
+    not_marked_fine = round(float(payload.not_marked_fine_pkr), 2)
     if grace < 0:
         raise HTTPException(status_code=400, detail="grace_period_mins must be >= 0")
-    if fine_rate < 0:
-        raise HTTPException(status_code=400, detail="fine_per_minute_pkr must be >= 0")
+    if late_fine < 0:
+        raise HTTPException(status_code=400, detail="late_fine_pkr must be >= 0")
+    if absent_fine < 0:
+        raise HTTPException(status_code=400, detail="absent_fine_pkr must be >= 0")
+    if not_marked_fine < 0:
+        raise HTTPException(status_code=400, detail="not_marked_fine_pkr must be >= 0")
 
     with get_conn_cursor(dictionary=True) as (_, cursor):
         _get_app_settings(cursor)
         cursor.execute(
             """
             UPDATE app_settings
-            SET shift_start_time=%s, grace_period_mins=%s, fine_per_minute_pkr=%s
+            SET shift_start_time=%s, grace_period_mins=%s, late_fine_pkr=%s, absent_fine_pkr=%s, not_marked_fine_pkr=%s
             WHERE id=1
             """,
-            (normalized_time, grace, fine_rate),
+            (normalized_time, grace, late_fine, absent_fine, not_marked_fine),
         )
         settings = _get_app_settings(cursor)
 
@@ -1782,7 +2775,9 @@ def update_admin_settings(payload: AppSettingsUpdateRequest, current_user: dict 
         {
             "shift_start_time": normalized_time,
             "grace_period_mins": grace,
-            "fine_per_minute_pkr": fine_rate,
+            "late_fine_pkr": late_fine,
+            "absent_fine_pkr": absent_fine,
+            "not_marked_fine_pkr": not_marked_fine,
         },
     )
 
@@ -1791,13 +2786,15 @@ def update_admin_settings(payload: AppSettingsUpdateRequest, current_user: dict 
         "settings": {
             "shift_start_time": settings["shift_start_time"],
             "grace_period_mins": settings["grace_period_mins"],
-            "fine_per_minute_pkr": settings["fine_per_minute_pkr"],
+            "late_fine_pkr": settings["late_fine_pkr"],
+            "absent_fine_pkr": settings["absent_fine_pkr"],
+            "not_marked_fine_pkr": settings["not_marked_fine_pkr"],
             "updated_at": settings["updated_at"].isoformat() if settings.get("updated_at") else None,
         },
     }
 
 @api.get("/users")
-def list_users(_: dict = Depends(require_admin)):
+def list_users(_: dict = Depends(require_permission("can_manage_users"))):
     cached = cache_get("users:list")
     if cached is not None:
         return cached
@@ -1805,12 +2802,34 @@ def list_users(_: dict = Depends(require_admin)):
     with get_conn_cursor(dictionary=True) as (_, cursor):
         cursor.execute(
             """
-            SELECT id, name, email, role, employee_id, created_at
-            FROM users
-            ORDER BY created_at DESC
+            SELECT u.id, u.name, u.email, u.role, u.employee_id, u.created_at, e.department
+            FROM users u
+            LEFT JOIN employees e ON e.id = u.employee_id
+            ORDER BY u.created_at DESC
             """
         )
         rows = cursor.fetchall()
+        user_ids = [int(r["id"]) for r in rows]
+        permissions_by_user: dict[int, list[dict]] = {}
+        if user_ids:
+            placeholders = ", ".join(["%s"] * len(user_ids))
+            cursor.execute(
+                f"""
+                SELECT user_id, permission_key, allowed_departments_json
+                FROM user_permissions
+                WHERE user_id IN ({placeholders})
+                ORDER BY permission_key ASC
+                """,
+                tuple(user_ids),
+            )
+            for permission_row in cursor.fetchall() or []:
+                uid = int(permission_row["user_id"])
+                permissions_by_user.setdefault(uid, []).append(
+                    {
+                        "key": str(permission_row["permission_key"]),
+                        "allowed_departments": json.loads(permission_row.get("allowed_departments_json") or "[]"),
+                    }
+                )
 
     result = {
         "ok": True,
@@ -1821,6 +2840,8 @@ def list_users(_: dict = Depends(require_admin)):
                 "email": r["email"],
                 "role": r["role"],
                 "employeeId": _employee_id_text(r.get("employee_id")) or None,
+                "department": r.get("department"),
+                "permissions": _normalize_permission_assignments(permissions_by_user.get(int(r["id"]), [])),
                 "createdAt": r["created_at"].isoformat() if r.get("created_at") else None,
             }
             for r in rows
@@ -1831,18 +2852,21 @@ def list_users(_: dict = Depends(require_admin)):
 
 
 @api.put("/users/{user_id}")
-def update_user(user_id: int, payload: UpdateUserRequest, current_user: dict = Depends(require_admin)):
+def update_user(user_id: int, payload: UpdateUserRequest, current_user: dict = Depends(require_permission("can_manage_users"))):
     normalized_name = str(payload.name).strip()
     normalized_email = str(payload.email).strip().lower()
     normalized_role = str(payload.role).strip().lower()
+    normalized_permissions = _normalize_permission_assignments(payload.permissions)
     if normalized_role not in {"admin", "user"}:
         raise HTTPException(status_code=400, detail="role must be admin or user")
 
     with get_conn_cursor(dictionary=True) as (_, cursor):
-        cursor.execute("SELECT id FROM users WHERE id=%s LIMIT 1", (user_id,))
+        cursor.execute("SELECT id, role FROM users WHERE id=%s LIMIT 1", (user_id,))
         existing = cursor.fetchone()
         if not existing:
             raise HTTPException(status_code=404, detail="User not found")
+        if user_id == int(current_user["id"]) and normalized_role != "admin":
+            raise HTTPException(status_code=400, detail="You cannot remove your own admin role.")
 
         cursor.execute("SELECT id FROM users WHERE LOWER(email)=LOWER(%s) AND id<>%s LIMIT 1", (normalized_email, user_id))
         email_conflict = cursor.fetchone()
@@ -1854,6 +2878,21 @@ def update_user(user_id: int, payload: UpdateUserRequest, current_user: dict = D
             employee_row = cursor.fetchone()
             if not employee_row:
                 raise HTTPException(status_code=404, detail="Employee not found")
+
+        validated_permissions: list[dict] = []
+        for permission in normalized_permissions:
+            validated_allowed_departments: list[str] = []
+            for department_name in permission["allowed_departments"]:
+                validated_allowed_departments.append(
+                    _resolve_department_name(cursor, department_name, require_active=False)
+                )
+            validated_permissions.append(
+                {
+                    "key": permission["key"],
+                    "allowed_departments": list(dict.fromkeys(validated_allowed_departments)),
+                }
+            )
+        normalized_permissions = validated_permissions
 
         _assert_employee_link_available(cursor, employee_id=payload.employee_id, current_user_id=user_id)
 
@@ -1875,11 +2914,33 @@ def update_user(user_id: int, payload: UpdateUserRequest, current_user: dict = D
                 (normalized_name, normalized_email, normalized_role, payload.employee_id, user_id),
             )
 
+        cursor.execute("DELETE FROM user_permissions WHERE user_id=%s", (user_id,))
+        if normalized_permissions:
+            cursor.executemany(
+                "INSERT INTO user_permissions (user_id, permission_key, allowed_departments_json) VALUES (%s, %s, %s)",
+                [
+                    (
+                        user_id,
+                        permission["key"],
+                        json.dumps(permission["allowed_departments"]) if permission["allowed_departments"] else None,
+                    )
+                    for permission in normalized_permissions
+                ],
+            )
+
         cursor.execute(
-            "SELECT id, name, email, role, employee_id, created_at FROM users WHERE id=%s LIMIT 1",
+            """
+            SELECT u.id, u.name, u.email, u.role, u.employee_id, u.force_password_change, u.created_at, e.photo_url, e.department
+            FROM users u
+            LEFT JOIN employees e ON e.id = u.employee_id
+            WHERE u.id=%s
+            LIMIT 1
+            """,
             (user_id,),
         )
         updated = cursor.fetchone()
+        if updated:
+            updated["permissions"] = normalized_permissions
 
     _audit(
         current_user["email"],
@@ -1889,6 +2950,7 @@ def update_user(user_id: int, payload: UpdateUserRequest, current_user: dict = D
             "role": normalized_role,
             "employeeId": _employee_id_text(payload.employee_id) or None,
             "passwordReset": bool(payload.password),
+            "permissions": normalized_permissions,
         },
     )
     cache_invalidate("users:")
@@ -1899,7 +2961,7 @@ def update_user(user_id: int, payload: UpdateUserRequest, current_user: dict = D
 
 
 @api.delete("/users/{user_id}")
-def delete_user(user_id: int, current_user: dict = Depends(require_admin)):
+def delete_user(user_id: int, current_user: dict = Depends(require_permission("can_manage_users"))):
     skipped_ids: list[int] = []
     deleted_ids: list[int] = []
     cascade_details: dict | None = None
@@ -1939,7 +3001,7 @@ def delete_user(user_id: int, current_user: dict = Depends(require_admin)):
 
 
 @api.post("/users/bulk-delete")
-def bulk_delete_users(payload: BulkDeleteUsersRequest, current_user: dict = Depends(require_admin)):
+def bulk_delete_users(payload: BulkDeleteUsersRequest, current_user: dict = Depends(require_permission("can_manage_users"))):
     requested_ids = sorted(set(int(uid) for uid in payload.userIds if isinstance(uid, int)))
     if not requested_ids:
         return {"ok": True, "deletedIds": [], "skippedIds": [], "message": "No user ids provided."}
@@ -1984,7 +3046,7 @@ def bulk_delete_users(payload: BulkDeleteUsersRequest, current_user: dict = Depe
 
 
 @api.post("/employees/enroll")
-def enroll_employee(payload: EnrollEmployeeRequest, current_user: dict = Depends(require_admin)):
+def enroll_employee(payload: EnrollEmployeeRequest, current_user: dict = Depends(require_permission("can_manage_employees"))):
     image_hash = _sha256_hex(_decode_base64_image_bytes(payload.imageBase64))
     try:
         image = face_engine.decode_image(payload.imageBase64)
@@ -1993,22 +3055,22 @@ def enroll_employee(payload: EnrollEmployeeRequest, current_user: dict = Depends
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
-    normalized_department = str(payload.department or "").strip()
-    if normalized_department not in ALLOWED_DEPARTMENTS:
-        raise HTTPException(status_code=400, detail="Invalid department value.")
-
     try:
         normalized_shift_start = _normalize_shift_time(payload.shift_start_time)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail="shift_start_time must be HH:MM or HH:MM:SS") from exc
     normalized_grace = int(payload.grace_period_mins)
-    normalized_fine_rate = round(float(payload.fine_per_minute_pkr), 2)
+    normalized_late_fine = round(float(payload.late_fine_pkr), 2)
+    normalized_absent_fine = round(float(payload.absent_fine_pkr), 2)
+    normalized_not_marked_fine = round(float(payload.not_marked_fine_pkr), 2)
+    normalized_off_days_json = _serialize_off_days(payload.off_days)
 
     requested_employee_id = _to_int_or_none(payload.employeeId)
     emb_id = str(uuid.uuid4())
     created_new = False
     employee_id = requested_employee_id
     with get_conn_cursor(dictionary=True) as (_, cursor):
+        normalized_department = _resolve_department_name(cursor, payload.department, require_active=True)
         _assert_new_capture_hash(cursor, image_hash=image_hash, context="enroll", employee_id=requested_employee_id)
         exists = None
         if requested_employee_id is not None:
@@ -2028,8 +3090,11 @@ def enroll_employee(payload: EnrollEmployeeRequest, current_user: dict = Depends
             created_new = True
             cursor.execute(
                 """
-                INSERT INTO employees (name, email, department, role, shift_start_time, grace_period_mins, fine_per_minute_pkr, is_active, photo_url)
-                VALUES (%s, %s, %s, %s, %s, %s, %s, 1, NULL)
+                INSERT INTO employees (
+                  name, email, department, role, shift_start_time, grace_period_mins,
+                  late_fine_pkr, absent_fine_pkr, not_marked_fine_pkr, off_days_json, is_active, photo_url
+                )
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, 1, NULL)
                 """,
                 (
                     payload.name,
@@ -2038,7 +3103,10 @@ def enroll_employee(payload: EnrollEmployeeRequest, current_user: dict = Depends
                     normalized_role,
                     normalized_shift_start,
                     normalized_grace,
-                    normalized_fine_rate,
+                    normalized_late_fine,
+                    normalized_absent_fine,
+                    normalized_not_marked_fine,
+                    normalized_off_days_json,
                 ),
             )
             employee_id = int(cursor.lastrowid)
@@ -2068,7 +3136,9 @@ def enroll_employee(payload: EnrollEmployeeRequest, current_user: dict = Depends
             cursor.execute(
                 """
                 UPDATE employees
-                SET name=%s, email=%s, department=%s, role=%s, shift_start_time=%s, grace_period_mins=%s, fine_per_minute_pkr=%s, is_active=1, photo_url=%s
+                SET
+                  name=%s, email=%s, department=%s, role=%s, shift_start_time=%s, grace_period_mins=%s,
+                  late_fine_pkr=%s, absent_fine_pkr=%s, not_marked_fine_pkr=%s, off_days_json=%s, is_active=1, photo_url=%s
                 WHERE id=%s
                 """,
                 (
@@ -2078,7 +3148,10 @@ def enroll_employee(payload: EnrollEmployeeRequest, current_user: dict = Depends
                     normalized_role,
                     normalized_shift_start,
                     normalized_grace,
-                    normalized_fine_rate,
+                    normalized_late_fine,
+                    normalized_absent_fine,
+                    normalized_not_marked_fine,
+                    normalized_off_days_json,
                     photo_url,
                     employee_id,
                 ),
@@ -2130,7 +3203,10 @@ def enroll_employee(payload: EnrollEmployeeRequest, current_user: dict = Depends
             "role": normalized_role,
             "shiftStartTime": normalized_shift_start,
             "gracePeriodMins": normalized_grace,
-            "finePerMinutePkr": normalized_fine_rate,
+            "lateFinePkr": normalized_late_fine,
+            "absentFinePkr": normalized_absent_fine,
+            "notMarkedFinePkr": normalized_not_marked_fine,
+            "offDays": _normalize_off_days(payload.off_days),
             "photoUrl": photo_url,
             "isActive": True,
         },
@@ -2147,7 +3223,7 @@ def checkin_me(payload: CheckInMeRequest, current_user: dict = Depends(get_curre
 
 
 @api.put("/admin/users/{user_id}/link-employee")
-def link_user_employee(user_id: int, payload: LinkEmployeeRequest, current_user: dict = Depends(require_admin)):
+def link_user_employee(user_id: int, payload: LinkEmployeeRequest, current_user: dict = Depends(require_permission("can_manage_users"))):
     with get_conn_cursor(dictionary=True) as (_, cursor):
         cursor.execute("SELECT id, email, employee_id FROM users WHERE id=%s LIMIT 1", (user_id,))
         target_user = cursor.fetchone()
@@ -2173,14 +3249,11 @@ def link_user_employee(user_id: int, payload: LinkEmployeeRequest, current_user:
 
 
 @api.put("/employees/{employee_id}")
-def update_employee(employee_id: str, payload: UpdateEmployeeRequest, current_user: dict = Depends(require_admin)):
+def update_employee(employee_id: str, payload: UpdateEmployeeRequest, current_user: dict = Depends(require_permission("can_manage_employees"))):
     updates = []
     values = []
+    normalized_email = str(payload.email).strip().lower() if payload.email is not None else None
     normalized_department = payload.department
-    if normalized_department is not None:
-        normalized_department = str(normalized_department).strip()
-        if normalized_department not in ALLOWED_DEPARTMENTS:
-            raise HTTPException(status_code=400, detail="Invalid department value.")
 
     normalized_role = payload.role
     if normalized_role is not None:
@@ -2205,25 +3278,48 @@ def update_employee(employee_id: str, payload: UpdateEmployeeRequest, current_us
         if normalized_grace < 0:
             raise HTTPException(status_code=400, detail="grace_period_mins must be >= 0")
 
-    normalized_fine_rate = payload.fine_per_minute_pkr
-    if normalized_fine_rate is not None:
-        normalized_fine_rate = round(float(normalized_fine_rate), 2)
-        if normalized_fine_rate < 0:
-            raise HTTPException(status_code=400, detail="fine_per_minute_pkr must be >= 0")
+    normalized_late_fine = payload.late_fine_pkr
+    if normalized_late_fine is not None:
+        normalized_late_fine = round(float(normalized_late_fine), 2)
+        if normalized_late_fine < 0:
+            raise HTTPException(status_code=400, detail="late_fine_pkr must be >= 0")
+
+    normalized_absent_fine = payload.absent_fine_pkr
+    if normalized_absent_fine is not None:
+        normalized_absent_fine = round(float(normalized_absent_fine), 2)
+        if normalized_absent_fine < 0:
+            raise HTTPException(status_code=400, detail="absent_fine_pkr must be >= 0")
+
+    normalized_not_marked_fine = payload.not_marked_fine_pkr
+    if normalized_not_marked_fine is not None:
+        normalized_not_marked_fine = round(float(normalized_not_marked_fine), 2)
+        if normalized_not_marked_fine < 0:
+            raise HTTPException(status_code=400, detail="not_marked_fine_pkr must be >= 0")
+
+    has_off_days_update = payload.off_days is not None
+    normalized_off_days_json = None
+    if payload.off_days is not None:
+        normalized_off_days_json = _serialize_off_days(payload.off_days)
 
     field_map = {
         "name": payload.name,
-        "email": payload.email,
+        "email": normalized_email,
         "department": normalized_department,
         "role": normalized_role,
         "shift_start_time": normalized_shift_start,
         "grace_period_mins": normalized_grace,
-        "fine_per_minute_pkr": normalized_fine_rate,
+        "late_fine_pkr": normalized_late_fine,
+        "absent_fine_pkr": normalized_absent_fine,
+        "not_marked_fine_pkr": normalized_not_marked_fine,
     }
     for key, value in field_map.items():
         if value is not None:
             updates.append(f"{key}=%s")
             values.append(value)
+
+    if has_off_days_update:
+        updates.append("off_days_json=%s")
+        values.append(normalized_off_days_json)
 
     if payload.is_active is not None:
         updates.append("is_active=%s")
@@ -2231,8 +3327,47 @@ def update_employee(employee_id: str, payload: UpdateEmployeeRequest, current_us
 
     if updates:
         values.append(employee_id)
-        with get_conn_cursor() as (_, cursor):
+        with get_conn_cursor(dictionary=True) as (_, cursor):
+            cursor.execute("SELECT email, department FROM employees WHERE id=%s LIMIT 1", (employee_id,))
+            existing_employee = cursor.fetchone()
+            if not existing_employee:
+                raise HTTPException(status_code=404, detail="Employee not found")
+
+            if normalized_department is not None:
+                normalized_department = _resolve_department_name(
+                    cursor,
+                    normalized_department,
+                    require_active=True,
+                    allow_inactive_if_name=str(existing_employee.get("department") or ""),
+                )
+                field_map["department"] = normalized_department
+                values = []
+                updates = []
+                for key, value in field_map.items():
+                    if value is not None:
+                        updates.append(f"{key}=%s")
+                        values.append(value)
+                if has_off_days_update:
+                    updates.append("off_days_json=%s")
+                    values.append(normalized_off_days_json)
+                if payload.is_active is not None:
+                    updates.append("is_active=%s")
+                    values.append(1 if payload.is_active else 0)
+                values.append(employee_id)
+
+            linked_user = _get_linked_user_for_employee(cursor, employee_id, existing_employee.get("email"))
+            if normalized_email and linked_user and str(linked_user.get("email") or "").strip().lower() != normalized_email:
+                cursor.execute(
+                    "SELECT id FROM users WHERE LOWER(email)=LOWER(%s) AND id<>%s LIMIT 1",
+                    (normalized_email, linked_user["id"]),
+                )
+                email_conflict = cursor.fetchone()
+                if email_conflict:
+                    raise HTTPException(status_code=409, detail="Email is already used by another user.")
+
             cursor.execute(f"UPDATE employees SET {', '.join(updates)} WHERE id=%s", tuple(values))
+            if normalized_email and linked_user:
+                cursor.execute("UPDATE users SET email=%s WHERE id=%s", (normalized_email, linked_user["id"]))
 
     photo_url = None
     if payload.imageBase64:
@@ -2268,11 +3403,231 @@ def update_employee(employee_id: str, payload: UpdateEmployeeRequest, current_us
 
     _audit(current_user["email"], "employee_update", {"employeeId": employee_id, "reenrolled": bool(payload.imageBase64)})
     cache_invalidate("employees:")
+    cache_invalidate("users:")
     return {"ok": True, "photoUrl": photo_url}
 
 
+@api.get("/employees/accessible")
+def list_accessible_employees(
+    permission_key: str = Query(..., pattern="^[a-z_]+$"),
+    current_user: dict = Depends(get_current_user),
+):
+    print(
+        {
+            "path": "/api/employees/accessible",
+            "permission_key": permission_key,
+            "current_user_id": current_user.get("id"),
+            "current_user_permissions": current_user.get("permissions"),
+        }
+    )
+    current_user_role = str(current_user.get("role") or "").strip().lower()
+    resolved_permission_key = resolve_effective_permission_key(current_user, permission_key)
+
+    if permission_key not in SCOPED_PERMISSION_KEYS:
+        raise HTTPException(status_code=400, detail="Unsupported scoped permission key.")
+
+    if current_user_role == "admin":
+        return list_employees(current_user)
+
+    if not resolved_permission_key:
+        raise HTTPException(status_code=403, detail="Permission denied")
+
+    allowed_departments = get_allowed_departments(current_user, resolved_permission_key)
+    if not allowed_departments:
+        raise HTTPException(status_code=403, detail="This permission requires a linked employee department.")
+
+    placeholders = ", ".join(["%s"] * len(allowed_departments))
+    with get_conn_cursor(dictionary=True) as (_, cursor):
+        cursor.execute(
+            f"""
+            SELECT
+              id, name, email, department, role, shift_start_time, grace_period_mins,
+              late_fine_pkr, absent_fine_pkr, not_marked_fine_pkr, off_days_json, is_active, photo_url, created_at
+            FROM employees
+            WHERE department IN ({placeholders})
+            ORDER BY is_active DESC, name ASC, created_at DESC
+            """,
+            tuple(allowed_departments),
+        )
+        rows = cursor.fetchall() or []
+
+    return {
+        "ok": True,
+        "employees": [
+            {
+                "id": str(r["id"]),
+                "name": r["name"],
+                "email": r["email"],
+                "department": r["department"],
+                "role": r["role"],
+                "shiftStartTime": _normalize_shift_time(r.get("shift_start_time")) if r.get("shift_start_time") else None,
+                "gracePeriodMins": int(r.get("grace_period_mins") or 15),
+                "lateFinePkr": float(r.get("late_fine_pkr") or 0),
+                "absentFinePkr": float(r.get("absent_fine_pkr") or 0),
+                "notMarkedFinePkr": float(r.get("not_marked_fine_pkr") or 0),
+                "offDays": _normalize_off_days(r.get("off_days_json")),
+                "isActive": bool(r["is_active"]),
+                "photoUrl": r["photo_url"],
+                "createdAt": r["created_at"].isoformat() if r["created_at"] else None,
+            }
+            for r in rows
+        ],
+    }
+
+
+@api.get("/admin/employees/{employee_id}")
+@api.get("/employees/{employee_id}")
+def get_employee_detail(employee_id: str, _: dict = Depends(require_permission("can_manage_employees"))):
+    with get_conn_cursor(dictionary=True) as (_, cursor):
+        cursor.execute(
+            """
+            SELECT
+              e.id, e.name, e.email, e.department, e.role, e.shift_start_time, e.grace_period_mins,
+              e.late_fine_pkr, e.absent_fine_pkr, e.not_marked_fine_pkr, e.off_days_json, e.is_active, e.photo_url,
+              e.created_at, e.updated_at
+            FROM employees e
+            WHERE e.id=%s
+            LIMIT 1
+            """,
+            (employee_id,),
+        )
+        employee = cursor.fetchone()
+        if not employee:
+            raise HTTPException(status_code=404, detail="Employee not found")
+
+        user = _get_linked_user_for_employee(cursor, employee_id, employee["email"]) or {}
+
+        cursor.execute(
+            """
+            SELECT
+              COUNT(*) AS total_records,
+              COUNT(CASE WHEN status='Present' THEN 1 END) AS present_days,
+              COUNT(CASE WHEN status='Late' THEN 1 END) AS late_days,
+              COALESCE(SUM(fine_amount), 0) AS total_fine,
+              MAX(created_at) AS last_checkin
+            FROM attendance
+            WHERE employee_id=%s
+            """,
+            (employee_id,),
+        )
+        summary = cursor.fetchone() or {}
+
+        cursor.execute(
+            """
+            SELECT COUNT(*) AS total_embeddings
+            FROM face_embeddings
+            WHERE employee_id=%s
+            """,
+            (employee_id,),
+        )
+        embedding_row = cursor.fetchone() or {}
+
+        cursor.execute(
+            """
+            SELECT id, date, checkin_time, status, fine_amount, confidence, source, created_at
+            FROM attendance
+            WHERE employee_id=%s
+            ORDER BY date DESC, created_at DESC
+            LIMIT 5
+            """,
+            (employee_id,),
+        )
+        recent_attendance = cursor.fetchall()
+
+    return {
+        "ok": True,
+        "employee": {
+            "id": str(employee["id"]),
+            "name": employee["name"],
+            "email": employee["email"],
+            "department": employee["department"],
+            "role": employee["role"],
+            "shiftStartTime": _normalize_shift_time(employee.get("shift_start_time")) if employee.get("shift_start_time") else None,
+            "gracePeriodMins": int(employee.get("grace_period_mins") or 0),
+            "lateFinePkr": float(employee.get("late_fine_pkr") or 0),
+            "absentFinePkr": float(employee.get("absent_fine_pkr") or 0),
+            "notMarkedFinePkr": float(employee.get("not_marked_fine_pkr") or 0),
+            "offDays": _normalize_off_days(employee.get("off_days_json")),
+            "isActive": bool(employee.get("is_active")),
+            "photoUrl": employee.get("photo_url"),
+            "createdAt": employee["created_at"].isoformat() if employee.get("created_at") else None,
+            "updatedAt": employee["updated_at"].isoformat() if employee.get("updated_at") else None,
+            "userId": int(user["id"]) if user.get("id") is not None else None,
+            "userRole": user.get("role"),
+            "forcePasswordChange": bool(user.get("force_password_change")),
+            "userCreatedAt": user["created_at"].isoformat() if user.get("created_at") else None,
+            "faceEmbeddingsCount": int(embedding_row.get("total_embeddings") or 0),
+        },
+        "attendanceSummary": {
+            "totalRecords": int(summary.get("total_records") or 0),
+            "presentDays": int(summary.get("present_days") or 0),
+            "lateDays": int(summary.get("late_days") or 0),
+            "totalFine": float(summary.get("total_fine") or 0),
+            "lastCheckin": summary["last_checkin"].isoformat() if summary.get("last_checkin") else None,
+        },
+        "recentAttendance": [
+            {
+                "id": row["id"],
+                "date": str(row["date"]),
+                "checkInTime": row.get("checkin_time"),
+                "status": row.get("status"),
+                "fineAmount": float(row.get("fine_amount") or 0),
+                "confidence": float(row.get("confidence") or 0),
+                "source": row.get("source"),
+                "createdAt": row["created_at"].isoformat() if row.get("created_at") else None,
+            }
+            for row in recent_attendance
+        ],
+    }
+
+
+@api.post("/admin/employees/{employee_id}/reset-password")
+@api.post("/employees/{employee_id}/reset-password")
+def admin_reset_employee_password(
+    employee_id: str,
+    payload: AdminResetEmployeePasswordRequest,
+    current_user: dict = Depends(require_permission("can_manage_employees")),
+):
+    temporary_password = str(payload.temporaryPassword or "").strip() or _generate_temporary_password()
+    if len(temporary_password) < 6:
+        raise HTTPException(status_code=400, detail="temporaryPassword must be at least 6 characters")
+
+    with get_conn_cursor(dictionary=True) as (_, cursor):
+        cursor.execute("SELECT id, name, email FROM employees WHERE id=%s LIMIT 1", (employee_id,))
+        employee = cursor.fetchone()
+        if not employee:
+            raise HTTPException(status_code=404, detail="Employee not found")
+
+        user = _get_linked_user_for_employee(cursor, employee_id, employee["email"])
+        if not user:
+            raise HTTPException(status_code=404, detail="No linked login account found for this employee")
+
+        cursor.execute(
+            "UPDATE users SET password_hash=%s, force_password_change=%s, employee_id=COALESCE(employee_id, %s) WHERE id=%s",
+            (
+                hash_password(temporary_password),
+                1 if payload.forcePasswordChange else 0,
+                employee_id,
+                user["id"],
+            ),
+        )
+
+    _audit(
+        current_user["email"],
+        "employee_password_reset",
+        {"employeeId": employee_id, "userId": user["id"], "forcePasswordChange": bool(payload.forcePasswordChange)},
+    )
+
+    return {
+        "ok": True,
+        "message": "Temporary password set successfully.",
+        "temporaryPassword": temporary_password,
+        "forcePasswordChange": bool(payload.forcePasswordChange),
+    }
+
+
 @api.delete("/employees/{employee_id}")
-def delete_employee(employee_id: str, current_user: dict = Depends(require_admin)):
+def delete_employee(employee_id: str, current_user: dict = Depends(require_permission("can_manage_employees"))):
     with get_conn_cursor(dictionary=True) as (_, cursor):
         cursor.execute("SELECT id, email, photo_url FROM employees WHERE id=%s LIMIT 1", (employee_id,))
         employee = cursor.fetchone()
@@ -2296,7 +3651,7 @@ def delete_employee(employee_id: str, current_user: dict = Depends(require_admin
 
 
 @api.post("/employees/bulk-delete")
-def bulk_delete_employees(payload: BulkDeleteEmployeesRequest, current_user: dict = Depends(require_admin)):
+def bulk_delete_employees(payload: BulkDeleteEmployeesRequest, current_user: dict = Depends(require_permission("can_manage_employees"))):
     requested_ids = sorted({int(eid) for eid in payload.ids if isinstance(eid, int)})
     if not requested_ids:
         return {"ok": True, "deletedIds": [], "message": "No employee ids provided."}
@@ -2336,7 +3691,7 @@ def bulk_delete_employees(payload: BulkDeleteEmployeesRequest, current_user: dic
 
 
 @api.get("/employees")
-def list_employees(_: dict = Depends(require_admin)):
+def list_employees(_: dict = Depends(require_permission("can_manage_employees"))):
     cached = cache_get("employees:list")
     if cached is not None:
         return cached
@@ -2344,7 +3699,9 @@ def list_employees(_: dict = Depends(require_admin)):
     with get_conn_cursor(dictionary=True) as (_, cursor):
         cursor.execute(
             """
-            SELECT id, name, email, department, role, shift_start_time, grace_period_mins, fine_per_minute_pkr, is_active, photo_url, created_at
+            SELECT
+              id, name, email, department, role, shift_start_time, grace_period_mins,
+              late_fine_pkr, absent_fine_pkr, not_marked_fine_pkr, off_days_json, is_active, photo_url, created_at
             FROM employees
             ORDER BY created_at DESC
             """
@@ -2362,7 +3719,10 @@ def list_employees(_: dict = Depends(require_admin)):
                 "role": r["role"],
                 "shiftStartTime": _normalize_shift_time(r.get("shift_start_time")) if r.get("shift_start_time") else None,
                 "gracePeriodMins": int(r.get("grace_period_mins") or 15),
-                "finePerMinutePkr": float(r.get("fine_per_minute_pkr") or 0),
+                "lateFinePkr": float(r.get("late_fine_pkr") or 0),
+                "absentFinePkr": float(r.get("absent_fine_pkr") or 0),
+                "notMarkedFinePkr": float(r.get("not_marked_fine_pkr") or 0),
+                "offDays": _normalize_off_days(r.get("off_days_json")),
                 "isActive": bool(r["is_active"]),
                 "photoUrl": r["photo_url"],
                 "createdAt": r["created_at"].isoformat() if r["created_at"] else None,
@@ -2402,7 +3762,7 @@ def checkin(payload: CheckInRequest, current_user: dict = Depends(get_current_us
                     raise HTTPException(status_code=403, detail="Check-in employee mismatch for current user.")
             cursor.execute(
                 """
-                SELECT shift_start_time, grace_period_mins, fine_per_minute_pkr
+                SELECT shift_start_time, grace_period_mins, late_fine_pkr, absent_fine_pkr, not_marked_fine_pkr, off_days_json
                 FROM employees
                 WHERE id=%s
                 LIMIT 1
@@ -2411,16 +3771,16 @@ def checkin(payload: CheckInRequest, current_user: dict = Depends(get_current_us
             )
             employee_settings = cursor.fetchone() or {}
             cursor.execute(
-                "SELECT checkin_time, fine_amount FROM attendance WHERE employee_id=%s AND date=%s LIMIT 1",
+                "SELECT checkin_time, fine_amount, status FROM attendance WHERE employee_id=%s AND date=%s LIMIT 1",
                 (payload.employeeId, today),
             )
             existing = cursor.fetchone()
             if existing:
-                existing_late_minutes, _ = _compute_fine(existing.get("checkin_time"), employee_settings)
+                _, existing_late_minutes, _ = _resolve_attendance_outcome(now.date(), existing.get("checkin_time"), employee_settings)
                 return {
                     "ok": True,
                     "already": True,
-                    "status": "Present",
+                    "status": existing.get("status") or "Present",
                     "fineAmount": float(existing.get("fine_amount") or 0),
                     "lateMinutes": existing_late_minutes,
                     "checkInTime": existing["checkin_time"],
@@ -2453,8 +3813,7 @@ def checkin(payload: CheckInRequest, current_user: dict = Depends(get_current_us
         ok = best >= face_engine.threshold
 
         if ok:
-            status = "Present"
-            late_minutes, fine = _compute_fine(checkin_time, employee_settings)
+            status, late_minutes, fine = _resolve_attendance_outcome(now.date(), checkin_time, employee_settings)
             with get_conn_cursor() as (_, cursor):
                 cursor.execute(
                     """
@@ -2506,11 +3865,12 @@ def admin_all_attendance(
     q: str | None = None,
     page: int = 1,
     limit: int = 20,
-    _: dict = Depends(require_admin),
+    current_user: dict = Depends(require_permission("can_view_all_attendance")),
 ):
     safe_page = max(1, int(page))
     safe_limit = max(1, min(100, int(limit)))
     offset = (safe_page - 1) * safe_limit
+    scoped_departments = _resolve_department_scope_for_user(current_user, permission_key="can_view_all_attendance")
 
     filters: list[str] = []
     params: list[object] = []
@@ -2523,7 +3883,16 @@ def admin_all_attendance(
     if employee_id:
         filters.append("a.employee_id = %s")
         params.append(employee_id)
-    if department:
+    if scoped_departments:
+        if department and department not in scoped_departments:
+            raise HTTPException(status_code=403, detail="Requested department is outside your allowed scope.")
+        placeholders = ", ".join(["%s"] * len(scoped_departments))
+        filters.append(f"e.department IN ({placeholders})")
+        params.extend(scoped_departments)
+        if department:
+            filters.append("e.department = %s")
+            params.append(department)
+    elif department:
         filters.append("e.department = %s")
         params.append(department)
     if q:
@@ -2552,7 +3921,7 @@ def admin_all_attendance(
               a.confidence, a.source, a.note, a.created_at, a.evidence_photo_url,
               e.id AS e_id, e.name AS e_name, e.email AS e_email, e.department AS e_department,
               e.role AS e_role, e.shift_start_time AS e_shift_start_time, e.grace_period_mins AS e_grace_period_mins,
-              e.fine_per_minute_pkr AS e_fine_per_minute_pkr, e.is_active AS e_is_active, e.photo_url AS e_photo_url
+              e.late_fine_pkr AS e_late_fine_pkr, e.is_active AS e_is_active, e.photo_url AS e_photo_url
             FROM attendance a
             JOIN employees e ON e.id = a.employee_id
             {where_clause}
@@ -2565,49 +3934,133 @@ def admin_all_attendance(
 
     items = []
     for r in rows:
-        late_minutes, _ = _compute_fine(
-            r.get("checkin_time"),
-            {
-                "shift_start_time": r.get("e_shift_start_time"),
-                "grace_period_mins": r.get("e_grace_period_mins"),
-                "fine_per_minute_pkr": r.get("e_fine_per_minute_pkr"),
-            },
-        )
-        items.append(
-            {
-                "id": r["id"],
-                "employee_id": str(r["employee_id"]),
-                "date": str(r["date"]),
-                "checkin_time": r["checkin_time"],
-                "status": r["status"],
-                "fine_amount": float(r["fine_amount"]),
-                "late_minutes": late_minutes,
-                "confidence": float(r["confidence"]),
-                "source": r.get("source"),
-                "note": r.get("note"),
-                "evidence_photo_url": r.get("evidence_photo_url"),
-                "created_at": r["created_at"].isoformat() if r.get("created_at") else None,
-                "employee": {
-                    "id": str(r["e_id"]),
-                    "name": r["e_name"],
-                    "email": r["e_email"],
-                    "department": r["e_department"],
-                    "role": r["e_role"],
-                    "is_active": bool(r["e_is_active"]),
-                    "photo_url": r["e_photo_url"],
-                },
-            }
-        )
+        items.append(_serialize_admin_attendance_item(r))
 
     return {"items": items, "total": total, "page": safe_page, "limit": safe_limit}
 
 
-@api.get("/admin/attendance/employee/{employee_id}")
-def admin_employee_attendance_report(employee_id: str, _: dict = Depends(require_admin)):
+@api.put("/admin/attendance/{attendance_id}")
+def admin_update_attendance(
+    attendance_id: str,
+    payload: UpdateAttendanceRequest,
+    current_user: dict = Depends(require_admin),
+):
     with get_conn_cursor(dictionary=True) as (_, cursor):
         cursor.execute(
             """
-            SELECT id, name, email, department, role, shift_start_time, grace_period_mins, fine_per_minute_pkr, is_active, photo_url
+            SELECT
+              a.id, a.employee_id, a.date, a.checkin_time, a.status, a.fine_amount,
+              a.confidence, a.source, a.note, a.created_at, a.evidence_photo_url,
+              e.id AS e_id, e.name AS e_name, e.email AS e_email, e.department AS e_department,
+              e.role AS e_role, e.shift_start_time AS e_shift_start_time, e.grace_period_mins AS e_grace_period_mins,
+              e.late_fine_pkr AS e_late_fine_pkr, e.absent_fine_pkr AS e_absent_fine_pkr,
+              e.not_marked_fine_pkr AS e_not_marked_fine_pkr, e.off_days_json AS e_off_days_json,
+              e.is_active AS e_is_active, e.photo_url AS e_photo_url
+            FROM attendance a
+            JOIN employees e ON e.id = a.employee_id
+            WHERE a.id=%s
+            LIMIT 1
+            """,
+            (attendance_id,),
+        )
+        row = cursor.fetchone()
+        if not row:
+            raise HTTPException(status_code=404, detail="Attendance record not found")
+
+        employee_settings = {
+            "shift_start_time": row.get("e_shift_start_time"),
+            "grace_period_mins": row.get("e_grace_period_mins"),
+            "late_fine_pkr": row.get("e_late_fine_pkr"),
+            "absent_fine_pkr": row.get("e_absent_fine_pkr"),
+            "not_marked_fine_pkr": row.get("e_not_marked_fine_pkr"),
+            "off_days_json": row.get("e_off_days_json"),
+        }
+        attendance_date = row["date"]
+        if isinstance(attendance_date, datetime):
+            attendance_date = attendance_date.date()
+
+        resolved_status, resolved_checkin_time, late_minutes, fine_amount = _normalize_attendance_update(
+            attendance_date=attendance_date,
+            employee_settings=employee_settings,
+            status_value=payload.status,
+            checkin_time_value=payload.checkin_time,
+        )
+
+        normalized_source = str(payload.source or "manual").strip().lower()
+        if normalized_source not in {"face", "manual"}:
+            raise HTTPException(status_code=400, detail="source must be face or manual")
+
+        normalized_note = str(payload.note or "").strip() or None
+        cursor.execute(
+            """
+            UPDATE attendance
+            SET checkin_time=%s, status=%s, fine_amount=%s, source=%s, note=%s
+            WHERE id=%s
+            """,
+            (
+                resolved_checkin_time,
+                resolved_status,
+                fine_amount,
+                normalized_source,
+                normalized_note,
+                attendance_id,
+            ),
+        )
+
+        cursor.execute(
+            """
+            SELECT
+              a.id, a.employee_id, a.date, a.checkin_time, a.status, a.fine_amount,
+              a.confidence, a.source, a.note, a.created_at, a.evidence_photo_url,
+              e.id AS e_id, e.name AS e_name, e.email AS e_email, e.department AS e_department,
+              e.role AS e_role, e.shift_start_time AS e_shift_start_time, e.grace_period_mins AS e_grace_period_mins,
+              e.late_fine_pkr AS e_late_fine_pkr, e.absent_fine_pkr AS e_absent_fine_pkr,
+              e.not_marked_fine_pkr AS e_not_marked_fine_pkr, e.off_days_json AS e_off_days_json,
+              e.is_active AS e_is_active, e.photo_url AS e_photo_url
+            FROM attendance a
+            JOIN employees e ON e.id = a.employee_id
+            WHERE a.id=%s
+            LIMIT 1
+            """,
+            (attendance_id,),
+        )
+        updated_row = cursor.fetchone()
+
+    cache_invalidate("attendance:")
+    cache_invalidate("audit_logs:")
+    _audit(
+        current_user["email"],
+        "attendance_admin_update",
+        {
+            "attendanceId": attendance_id,
+            "employeeId": str(row["employee_id"]),
+            "status": resolved_status,
+            "checkInTime": resolved_checkin_time,
+            "lateMinutes": late_minutes,
+            "fineAmount": fine_amount,
+            "source": normalized_source,
+            "note": normalized_note,
+        },
+    )
+
+    return {
+        "ok": True,
+        "item": _serialize_admin_attendance_item(updated_row or row, employee_settings=employee_settings),
+    }
+
+
+@api.get("/admin/attendance/employee/{employee_id}")
+def admin_employee_attendance_report(
+    employee_id: str,
+    current_user: dict = Depends(require_permission("can_view_all_attendance")),
+):
+    scoped_departments = _resolve_department_scope_for_user(current_user, permission_key="can_view_all_attendance")
+    with get_conn_cursor(dictionary=True) as (_, cursor):
+        cursor.execute(
+            """
+            SELECT
+              id, name, email, department, role, shift_start_time, grace_period_mins,
+              late_fine_pkr, absent_fine_pkr, not_marked_fine_pkr, off_days_json, is_active, photo_url
             FROM employees
             WHERE id=%s
             LIMIT 1
@@ -2617,6 +4070,8 @@ def admin_employee_attendance_report(employee_id: str, _: dict = Depends(require
         employee = cursor.fetchone()
         if not employee:
             raise HTTPException(status_code=404, detail="Employee not found")
+        if scoped_departments and str(employee.get("department") or "").strip() not in scoped_departments:
+            raise HTTPException(status_code=403, detail="You can only view attendance for your own department.")
 
         cursor.execute(
             """
@@ -2674,7 +4129,7 @@ def admin_employee_attendance_report(employee_id: str, _: dict = Depends(require
                     {
                         "shift_start_time": employee.get("shift_start_time"),
                         "grace_period_mins": employee.get("grace_period_mins"),
-                        "fine_per_minute_pkr": employee.get("fine_per_minute_pkr"),
+                        "late_fine_pkr": employee.get("late_fine_pkr"),
                     },
                 )[0],
                 "confidence": float(r["confidence"]),
@@ -2700,7 +4155,7 @@ def today_attendance(_: dict = Depends(require_admin)):
             """
             SELECT a.id, a.employee_id, a.date, a.checkin_time, a.status, a.fine_amount,
                    a.confidence, a.source, a.evidence_photo_url, a.created_at, e.name, e.department, e.role, e.photo_url,
-                   e.shift_start_time, e.grace_period_mins, e.fine_per_minute_pkr
+                   e.shift_start_time, e.grace_period_mins, e.late_fine_pkr
             FROM attendance a
             JOIN employees e ON e.id = a.employee_id
             WHERE a.date=%s
@@ -2729,7 +4184,7 @@ def today_attendance(_: dict = Depends(require_admin)):
                     {
                         "shift_start_time": r.get("shift_start_time"),
                         "grace_period_mins": r.get("grace_period_mins"),
-                        "fine_per_minute_pkr": r.get("fine_per_minute_pkr"),
+                        "late_fine_pkr": r.get("late_fine_pkr"),
                     },
                 )[0],
                 "confidence": float(r["confidence"]),
@@ -2754,7 +4209,9 @@ def attendance_history(employee_id: str, current_user: dict = Depends(get_curren
     with get_conn_cursor(dictionary=True) as (_, cursor):
         cursor.execute(
             """
-            SELECT id, name, email, department, role, shift_start_time, grace_period_mins, fine_per_minute_pkr, is_active, photo_url
+            SELECT
+              id, name, email, department, role, shift_start_time, grace_period_mins,
+              late_fine_pkr, absent_fine_pkr, not_marked_fine_pkr, is_active, photo_url
             FROM employees
             WHERE id=%s
             LIMIT 1
@@ -2800,7 +4257,7 @@ def attendance_history(employee_id: str, current_user: dict = Depends(get_curren
                     {
                         "shift_start_time": employee.get("shift_start_time") if employee else None,
                         "grace_period_mins": employee.get("grace_period_mins") if employee else None,
-                        "fine_per_minute_pkr": employee.get("fine_per_minute_pkr") if employee else None,
+                        "late_fine_pkr": employee.get("late_fine_pkr") if employee else None,
                     },
                 )[0],
                 "confidence": float(r["confidence"]),
@@ -2823,8 +4280,93 @@ def attendance_history_me(current_user: dict = Depends(get_current_user)):
 
 
 @api.get("/attendance/month")
-def attendance_month(year: int, month: int, current_user: dict = Depends(get_current_user)):
-    employee_id = _resolve_employee_id_for_current_user(current_user)
+def attendance_month(
+    year: int,
+    month: int,
+    employee_id: str | None = Query(default=None),
+    current_user: dict = Depends(get_current_user),
+):
+    requested_employee_id = str(employee_id or "").strip()
+    current_user_role = str(current_user.get("role") or "").strip().lower()
+    resolved_monthly_permission_key = resolve_effective_permission_key(current_user, "can_view_monthly_attendance")
+    can_view_scoped_monthly = has_effective_permission(current_user, "can_view_monthly_attendance")
+
+    print(
+        "[monthly-permission-debug]",
+        json.dumps(
+            {
+                "path": "/api/attendance/month",
+                "current_user_id": current_user.get("id"),
+                "current_user_permissions": current_user.get("permissions") or [],
+                "requested_permission_key": "can_view_monthly_attendance",
+                "resolved_permission_key": resolved_monthly_permission_key,
+                "has_monthly_permission": has_permission(current_user, "can_view_monthly_attendance"),
+                "allowed_departments": (
+                    get_allowed_departments(current_user, "can_view_monthly_attendance")
+                    if can_view_scoped_monthly and current_user_role != "admin"
+                    else None
+                ),
+                "branch": "route_entry",
+            },
+            default=str,
+        ),
+    )
+
+    if requested_employee_id:
+        if current_user_role == "admin":
+            employee_id = requested_employee_id
+        elif can_view_scoped_monthly:
+            with get_conn_cursor(dictionary=True) as (_, cursor):
+                cursor.execute(
+                    "SELECT id, department FROM employees WHERE id=%s LIMIT 1",
+                    (requested_employee_id,),
+                )
+                employee_row = cursor.fetchone()
+            if not employee_row:
+                raise HTTPException(status_code=404, detail="Employee not found.")
+            allowed_departments = _resolve_department_scope_for_user(
+                current_user,
+                permission_key="can_view_monthly_attendance",
+            )
+            if employee_row.get("department") not in allowed_departments:
+                raise HTTPException(status_code=403, detail="You are not allowed to view this employee's monthly attendance.")
+            employee_id = requested_employee_id
+        else:
+            own_employee_id = _resolve_employee_id_for_current_user(current_user)
+            if not own_employee_id:
+                raise HTTPException(status_code=400, detail="Your account is not linked to an employee ID. Ask admin to link your account.")
+            if requested_employee_id != own_employee_id:
+                raise HTTPException(status_code=403, detail="You are not allowed to view another employee's attendance.")
+            employee_id = own_employee_id
+    else:
+        if current_user_role == "admin":
+            employee_id = _resolve_employee_id_for_current_user(current_user)
+        elif can_view_scoped_monthly:
+            own_employee_id = _resolve_employee_id_for_current_user(current_user)
+            if own_employee_id:
+                employee_id = own_employee_id
+            else:
+                allowed_departments = _resolve_department_scope_for_user(
+                    current_user,
+                    permission_key="can_view_monthly_attendance",
+                )
+                placeholders = ", ".join(["%s"] * len(allowed_departments))
+                with get_conn_cursor(dictionary=True) as (_, cursor):
+                    cursor.execute(
+                        f"""
+                        SELECT id
+                        FROM employees
+                        WHERE department IN ({placeholders})
+                        ORDER BY is_active DESC, name ASC, id ASC
+                        LIMIT 1
+                        """,
+                        tuple(allowed_departments),
+                    )
+                    employee_row = cursor.fetchone()
+                employee_id = str(employee_row["id"]) if employee_row else None
+        else:
+            employee_id = _resolve_employee_id_for_current_user(current_user)
+
     if not employee_id:
         raise HTTPException(status_code=400, detail="Your account is not linked to an employee ID. Ask admin to link your account.")
 
@@ -2834,7 +4376,7 @@ def attendance_month(year: int, month: int, current_user: dict = Depends(get_cur
     with get_conn_cursor(dictionary=True) as (_, cursor):
         cursor.execute(
             """
-            SELECT shift_start_time, grace_period_mins, fine_per_minute_pkr
+            SELECT shift_start_time, grace_period_mins, late_fine_pkr, absent_fine_pkr, not_marked_fine_pkr, off_days_json, created_at
             FROM employees
             WHERE id=%s
             LIMIT 1
@@ -2860,21 +4402,34 @@ def attendance_month(year: int, month: int, current_user: dict = Depends(get_cur
         key = cursor_day.isoformat()
         row = by_day.get(key)
         if row:
-            normalized_status = "present" if str(row.get("status") or "").strip().lower() == "present" else "absent"
+            join_date = _employee_join_date(employee_settings)
+            if join_date and cursor_day < join_date:
+                normalized_status = "pre_join"
+                late_minutes = 0
+                fine_amount = 0.0
+            elif _is_employee_off_day(cursor_day, employee_settings):
+                normalized_status = "off"
+                late_minutes = 0
+                fine_amount = 0.0
+            else:
+                row_status = str(row.get("status") or "").strip().lower()
+                normalized_status = "present" if row_status in {"present", "late"} else "absent"
+                late_minutes = _compute_fine(row.get("checkin_time"), employee_settings)[0]
+                fine_amount = float(row.get("fine_amount") or 0)
             month_days.append(
                 {
                     "date": key,
                     "weekday": cursor_day.strftime("%a"),
                     "status": normalized_status,
                     "checkin_time": row.get("checkin_time"),
-                    "late_minutes": _compute_fine(row.get("checkin_time"), employee_settings)[0],
-                    "fine_amount": float(row.get("fine_amount") or 0),
+                    "late_minutes": late_minutes,
+                    "fine_amount": fine_amount,
                     "source": row.get("source"),
                     "evidence_photo_url": row.get("evidence_photo_url"),
                 }
             )
         else:
-            derived_status = "absent" if cursor_day < today else "not_marked"
+            derived_status, derived_fine = _derive_missing_day(cursor_day, today, employee_settings)
             month_days.append(
                 {
                     "date": key,
@@ -2882,18 +4437,23 @@ def attendance_month(year: int, month: int, current_user: dict = Depends(get_cur
                     "status": derived_status,
                     "checkin_time": None,
                     "late_minutes": 0,
-                    "fine_amount": 0.0,
+                    "fine_amount": derived_fine,
                     "source": None,
                     "evidence_photo_url": None,
                 }
             )
         cursor_day += timedelta(days=1)
 
-    return {"ok": True, "year": year, "month": month, "month_days": month_days}
+    return {"ok": True, "employee_id": str(employee_id), "year": year, "month": month, "month_days": month_days}
 
 
 @api.post("/attendance/manual-selfie")
-async def manual_selfie_attendance(file: UploadFile = File(...), current_user: dict = Depends(get_current_user)):
+async def manual_selfie_attendance(
+    request: Request,
+    file: UploadFile = File(...),
+    device_info: str | None = Form(default=None, max_length=255),
+    current_user: dict = Depends(get_current_user),
+):
     employee_id = _resolve_employee_id_for_current_user(current_user)
     if not employee_id:
         raise HTTPException(status_code=400, detail="Your account is not linked to an employee ID. Ask admin to link your account.")
@@ -2921,13 +4481,16 @@ async def manual_selfie_attendance(file: UploadFile = File(...), current_user: d
     evidence_photo_url: str | None = None
     late_minutes = 0
     fine_amount = 0.0
+    device_info_raw = str(device_info or "").strip()
+    device_info = device_info_raw[:255] if device_info_raw else None
+    device_ip = _client_ip(request)
 
     try:
         with get_conn_cursor(dictionary=True) as (_, cursor):
             _assert_new_capture_hash(cursor, image_hash=image_hash, context="checkin", employee_id=employee_id)
             cursor.execute(
                 """
-                SELECT shift_start_time, grace_period_mins, fine_per_minute_pkr
+                SELECT shift_start_time, grace_period_mins, late_fine_pkr, absent_fine_pkr, not_marked_fine_pkr, off_days_json
                 FROM employees
                 WHERE id=%s
                 LIMIT 1
@@ -2943,31 +4506,36 @@ async def manual_selfie_attendance(file: UploadFile = File(...), current_user: d
             if existing:
                 raise HTTPException(status_code=409, detail="Already marked today")
 
-            late_minutes, fine_amount = _compute_fine(checkin_time, employee_settings)
+            status_label, late_minutes, fine_amount = _resolve_attendance_outcome(today, checkin_time, employee_settings)
             evidence_photo_url = _save_manual_selfie_image(employee_id=employee_id, today=today, content=content)
             attendance_id = str(uuid.uuid4())
             cursor.execute(
                 """
                 INSERT INTO attendance (
                   id, employee_id, date, checkin_time, status, fine_amount, confidence,
-                  source, marked_by_user_id, note, evidence_photo_url
+                  source, marked_by_user_id, note, evidence_photo_url, device_info, device_ip
                 )
-                VALUES (%s, %s, %s, %s, 'Present', %s, 0, 'manual', %s, NULL, %s)
+                VALUES (%s, %s, %s, %s, %s, %s, 0, 'manual', %s, NULL, %s, %s, %s)
                 """,
                 (
                     attendance_id,
                     employee_id,
                     today_str,
                     checkin_time,
+                    status_label,
                     fine_amount,
                     current_user["id"],
                     evidence_photo_url,
+                    device_info,
+                    device_ip,
                 ),
             )
 
             cursor.execute(
                 """
-                SELECT id, employee_id, date, checkin_time, status, fine_amount, confidence, source, created_at, evidence_photo_url
+                SELECT
+                  id, employee_id, date, checkin_time, status, fine_amount, confidence,
+                  source, created_at, evidence_photo_url, device_info, device_ip
                 FROM attendance
                 WHERE id=%s
                 LIMIT 1
@@ -2985,7 +4553,7 @@ async def manual_selfie_attendance(file: UploadFile = File(...), current_user: d
     _audit(
         current_user["email"],
         "attendance_manual_selfie_mark",
-        {"employeeId": employee_id, "date": today_str, "status": "Present", "lateMinutes": late_minutes, "fineAmount": fine_amount},
+        {"employeeId": employee_id, "date": today_str, "status": created["status"], "lateMinutes": late_minutes, "fineAmount": fine_amount},
     )
     cache_invalidate("attendance:")
 
@@ -3005,6 +4573,8 @@ async def manual_selfie_attendance(file: UploadFile = File(...), current_user: d
             "confidence": float(created["confidence"]),
             "source": created.get("source"),
             "evidence_photo_url": created.get("evidence_photo_url"),
+            "device_info": created.get("device_info"),
+            "device_ip": created.get("device_ip"),
             "created_at": created["created_at"].isoformat() if created.get("created_at") else None,
         },
     }
@@ -3025,7 +4595,7 @@ def attendance_month_me(month: str, current_user: dict = Depends(get_current_use
     with get_conn_cursor(dictionary=True) as (_, cursor):
         cursor.execute(
             """
-            SELECT shift_start_time, grace_period_mins, fine_per_minute_pkr
+            SELECT shift_start_time, grace_period_mins, late_fine_pkr, absent_fine_pkr, not_marked_fine_pkr, off_days_json, created_at
             FROM employees
             WHERE id=%s
             LIMIT 1
@@ -3051,28 +4621,47 @@ def attendance_month_me(month: str, current_user: dict = Depends(get_current_use
         key = cursor_day.isoformat()
         row = by_day.get(key)
         if row:
+            row_status = str(row.get("status") or "").strip().lower()
+            join_date = _employee_join_date(employee_settings)
+            if join_date and cursor_day < join_date:
+                display_status = "Pre-Join"
+                late_minutes = 0
+                fine_amount = 0.0
+            elif _is_employee_off_day(cursor_day, employee_settings):
+                display_status = "Off"
+                late_minutes = 0
+                fine_amount = 0.0
+            else:
+                display_status = "Present" if row_status in {"present", "late"} else row["status"]
+                late_minutes = _compute_fine(row.get("checkin_time"), employee_settings)[0]
+                fine_amount = float(row["fine_amount"])
             days.append(
                 {
                     "date": key,
-                    "status": row["status"],
+                    "status": display_status,
                     "checkInTime": row["checkin_time"],
-                    "lateMinutes": _compute_fine(row.get("checkin_time"), employee_settings)[0],
+                    "lateMinutes": late_minutes,
                     "source": row.get("source"),
                     "confidence": float(row["confidence"]),
-                    "fineAmount": float(row["fine_amount"]),
+                    "fineAmount": fine_amount,
                     "evidencePhotoUrl": row.get("evidence_photo_url"),
                 }
             )
         else:
+            derived_status, derived_fine = _derive_missing_day(cursor_day, date.today(), employee_settings)
             days.append(
                 {
                     "date": key,
-                    "status": "Late",
+                    "status": (
+                        "Pre-Join"
+                        if derived_status == "pre_join"
+                        else ("Off" if derived_status == "off" else ("Absent" if derived_status == "absent" else "Not Marked"))
+                    ),
                     "checkInTime": None,
                     "lateMinutes": 0,
                     "source": None,
                     "confidence": 0.0,
-                    "fineAmount": 0.0,
+                    "fineAmount": derived_fine,
                     "evidencePhotoUrl": None,
                 }
             )
@@ -3115,7 +4704,7 @@ def manual_attendance_today(payload: dict | None = Body(default=None), current_u
     with get_conn_cursor(dictionary=True) as (_, cursor):
         cursor.execute(
             """
-            SELECT shift_start_time, grace_period_mins, fine_per_minute_pkr
+            SELECT shift_start_time, grace_period_mins, late_fine_pkr, absent_fine_pkr, not_marked_fine_pkr, off_days_json
             FROM employees
             WHERE id=%s
             LIMIT 1
@@ -3123,7 +4712,7 @@ def manual_attendance_today(payload: dict | None = Body(default=None), current_u
             (employee_id,),
         )
         employee_settings = cursor.fetchone() or {}
-        late_minutes, fine_amount = _compute_fine(checkin_time, employee_settings)
+        status_label, late_minutes, fine_amount = _resolve_attendance_outcome(today, checkin_time, employee_settings)
         cursor.execute(
             "SELECT id, source FROM attendance WHERE employee_id=%s AND date=%s LIMIT 1",
             (employee_id, today_str),
@@ -3137,13 +4726,14 @@ def manual_attendance_today(payload: dict | None = Body(default=None), current_u
             INSERT INTO attendance (
               id, employee_id, date, checkin_time, status, fine_amount, confidence, source, marked_by_user_id, note
             )
-            VALUES (%s, %s, %s, %s, 'Present', %s, 0, 'manual', %s, NULL)
+            VALUES (%s, %s, %s, %s, %s, %s, 0, 'manual', %s, NULL)
             """,
             (
                 str(uuid.uuid4()),
                 employee_id,
                 today_str,
                 checkin_time,
+                status_label,
                 fine_amount,
                 current_user["id"],
             ),
@@ -3152,14 +4742,14 @@ def manual_attendance_today(payload: dict | None = Body(default=None), current_u
     _audit(
         current_user["email"],
         "attendance_manual_mark",
-        {"employeeId": employee_id, "date": today_str, "status": "Present", "lateMinutes": late_minutes, "fineAmount": fine_amount},
+        {"employeeId": employee_id, "date": today_str, "status": status_label, "lateMinutes": late_minutes, "fineAmount": fine_amount},
     )
     cache_invalidate("attendance:")
     return {
         "ok": True,
         "already": False,
         "date": today_str,
-        "status": "Present",
+        "status": status_label,
         "checkInTime": checkin_time,
         "fineAmount": fine_amount,
         "lateMinutes": late_minutes,
@@ -3168,7 +4758,7 @@ def manual_attendance_today(payload: dict | None = Body(default=None), current_u
 
 
 @api.get("/admin/backup/download")
-def admin_backup_download(current_user: dict = Depends(require_admin)):
+def admin_backup_download(current_user: dict = Depends(require_permission("can_backup_restore"))):
     temp_dir = Path(tempfile.mkdtemp(prefix="ivs_backup_download_"))
     zip_name = _backup_filename("backup")
     zip_path = temp_dir / zip_name
@@ -3205,7 +4795,7 @@ def admin_backup_download(current_user: dict = Depends(require_admin)):
 @api.post("/admin/backup/restore")
 async def admin_backup_restore(
     file: UploadFile = File(...),
-    current_user: dict = Depends(require_admin),
+    current_user: dict = Depends(require_permission("can_backup_restore")),
 ):
     filename = str(file.filename or "").strip()
     content_type = (file.content_type or "").lower().strip()
@@ -3288,7 +4878,7 @@ async def admin_backup_restore(
 
 
 @api.get("/audit/logs")
-def audit_logs(limit: int = 200, _: dict = Depends(require_admin)):
+def audit_logs(limit: int = 200, _: dict = Depends(require_permission("can_view_audit_logs"))):
     safe_limit = max(1, min(1000, limit))
     cache_key = f"audit_logs:{safe_limit}"
     cached = cache_get(cache_key)
