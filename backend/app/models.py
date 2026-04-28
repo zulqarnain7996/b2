@@ -185,10 +185,16 @@ class MarkMonthlyAttendanceRequest(BaseModel):
 
 
 class UpdateAttendanceRequest(BaseModel):
-    status: Literal["Present", "Late", "Absent"]
+    status: Literal["Present", "Late", "Absent", "Leave"]
     checkin_time: Optional[str] = Field(default=None, max_length=5)
     source: Literal["face", "manual"] = "manual"
     note: Optional[str] = Field(default=None, max_length=255)
+
+
+class AdminMonthlyLeaveRequest(BaseModel):
+    employee_id: str = Field(min_length=1, max_length=64)
+    date: str = Field(min_length=10, max_length=10)
+    note: str = Field(min_length=1, max_length=255)
 
 
 class DepartmentCreateRequest(BaseModel):

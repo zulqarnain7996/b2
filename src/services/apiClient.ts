@@ -1,4 +1,7 @@
 import type {
+  AdminAttendanceResponse,
+  AdminAttendanceSummary,
+  AdminDashboardSummaryResponse,
   AdminAttendanceEmployeeReport,
   AdminEmployeeDetail,
   AdminAttendanceItem,
@@ -139,6 +142,7 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
   }
 
   const response = await fetch(`${API_BASE}${path}`, {
+    credentials: "include",
     headers,
     ...init,
   });
@@ -161,7 +165,6 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
       });
     }
     if (response.status === 401 && path === "/auth/me") {
-      sessionStorage.removeItem("authToken");
       setAccessToken(null);
       if (typeof window !== "undefined" && window.location.pathname !== "/login") {
         window.location.assign("/login");
@@ -209,6 +212,12 @@ export const apiClient = {
     request<{ token: string; user: AuthUser }>("/auth/login", {
       method: "POST",
       body: JSON.stringify(payload),
+    }),
+
+  logout: () =>
+    request<{ ok: boolean }>("/auth/logout", {
+      method: "POST",
+      body: JSON.stringify({}),
     }),
 
   getMe: () => request<{ user: AuthUser }>("/auth/me"),
@@ -450,6 +459,7 @@ export const apiClient = {
     }),
 
   getTodayAttendance: () => request<{ ok: boolean; records: AttendanceRecord[] }>("/attendance/today"),
+  getMyTodayAttendance: () => request<{ ok: boolean; record: AttendanceRecord | null }>("/attendance/today/me"),
 
   getHistory: (employeeId: string) => request<MyHistoryResponse>(`/attendance/history/${employeeId}`),
   getMyHistory: () => request<MyHistoryResponse>("/attendance/history/me"),
@@ -507,6 +517,69 @@ export const apiClient = {
       body: formData,
     });
   },
+  adminAdjustMonthlyAttendance: (
+    file: File,
+    payload: {
+      employee_id: string;
+      date: string;
+      checkin_time: string;
+      note?: string;
+      device_info?: string;
+    },
+  ) => {
+    const formData = new FormData();
+    formData.append("file", file);
+    formData.append("employee_id", payload.employee_id);
+    formData.append("date", payload.date);
+    formData.append("checkin_time", payload.checkin_time);
+    if (payload.note) {
+      formData.append("note", payload.note);
+    }
+    if (payload.device_info) {
+      formData.append("device_info", payload.device_info);
+    }
+    return request<{
+      ok: boolean;
+      attendance: {
+        id: string;
+        employee_id: string;
+        date: string;
+        checkin_time: string | null;
+        status: string;
+        late_minutes?: number;
+        fine_amount: number;
+        confidence: number;
+        source: "manual" | "face";
+        evidence_photo_url: string | null;
+        note?: string | null;
+        created_at: string | null;
+      };
+    }>("/admin/attendance/monthly-adjustment", {
+      method: "POST",
+      body: formData,
+    });
+  },
+  adminMarkMonthlyLeave: (payload: { employee_id: string; date: string; note: string }) =>
+    request<{
+      ok: boolean;
+      attendance: {
+        id: string;
+        employee_id: string;
+        date: string;
+        checkin_time: string | null;
+        status: string;
+        late_minutes?: number;
+        fine_amount: number;
+        confidence: number;
+        source: "manual" | "face";
+        evidence_photo_url: string | null;
+        note?: string | null;
+        created_at: string | null;
+      };
+    }>("/admin/attendance/monthly-leave", {
+      method: "POST",
+      body: JSON.stringify(payload),
+    }),
   markMyMonthAttendance: (payload: {
     date: string;
     status: "Present" | "Late";
@@ -529,6 +602,10 @@ export const apiClient = {
     employee_id?: string;
     department?: string;
     q?: string;
+    source?: "face" | "manual" | "all";
+    lateness?: "late" | "on_time" | "all";
+    status?: "present" | "absent" | "all";
+    sort?: "recent" | "fine_desc";
     page?: number;
     limit?: number;
   }) => {
@@ -538,13 +615,20 @@ export const apiClient = {
     if (params?.employee_id) query.set("employee_id", params.employee_id);
     if (params?.department) query.set("department", params.department);
     if (params?.q) query.set("q", params.q);
+    if (params?.source && params.source !== "all") query.set("source", params.source);
+    if (params?.lateness && params.lateness !== "all") query.set("lateness", params.lateness);
+    if (params?.status && params.status !== "all") query.set("status", params.status);
+    if (params?.sort && params.sort !== "recent") query.set("sort", params.sort);
     if (params?.page) query.set("page", String(params.page));
     if (params?.limit) query.set("limit", String(params.limit));
     const suffix = query.toString() ? `?${query.toString()}` : "";
-    return request<{ items: AdminAttendanceItem[]; total: number; page: number; limit: number }>(
+    return request<AdminAttendanceResponse>(
       `/admin/attendance${suffix}`,
     );
   },
+
+  getAdminDashboardSummary: () =>
+    request<AdminDashboardSummaryResponse>("/admin/dashboard/summary"),
 
   getAdminAttendanceEmployeeReport: (employeeId: string) =>
     request<AdminAttendanceEmployeeReport>(`/admin/attendance/employee/${encodeURIComponent(employeeId)}`),
@@ -552,7 +636,7 @@ export const apiClient = {
   updateAdminAttendance: (
     id: string,
     payload: {
-      status: "Present" | "Late" | "Absent";
+      status: "Present" | "Late" | "Absent" | "Leave";
       checkin_time: string | null;
       source: "face" | "manual";
       note?: string;
@@ -645,7 +729,7 @@ export const apiClient = {
   downloadBackup: async () => {
     const headers: Record<string, string> = {};
     if (accessToken) headers.Authorization = `Bearer ${accessToken}`;
-    const response = await fetch(`${API_BASE}/admin/backup/download`, { method: "GET", headers });
+    const response = await fetch(`${API_BASE}/admin/backup/download`, { method: "GET", headers, credentials: "include" });
     if (!response.ok) {
       const raw = await response.text();
       let detail = "Backup download failed";
@@ -675,6 +759,7 @@ export const apiClient = {
     new Promise<{ ok: boolean; message: string; steps: string[] }>((resolve, reject) => {
       const xhr = new XMLHttpRequest();
       xhr.open("POST", `${API_BASE}/admin/backup/restore`);
+      xhr.withCredentials = true;
       if (accessToken) xhr.setRequestHeader("Authorization", `Bearer ${accessToken}`);
       xhr.responseType = "json";
       xhr.upload.onprogress = (event) => {

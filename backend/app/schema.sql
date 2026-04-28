@@ -62,7 +62,7 @@ CREATE TABLE IF NOT EXISTS attendance (
   id VARCHAR(64) PRIMARY KEY,
   employee_id INT NOT NULL,
   date DATE NOT NULL,
-  checkin_time VARCHAR(5) NOT NULL,
+  checkin_time VARCHAR(5) NULL,
   status VARCHAR(64) NOT NULL,
   fine_amount DECIMAL(10,2) NOT NULL DEFAULT 0,
   confidence FLOAT NOT NULL,

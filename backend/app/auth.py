@@ -11,7 +11,7 @@ from typing import Any
 import bcrypt
 import jwt
 from dotenv import load_dotenv
-from fastapi import Depends, HTTPException, status
+from fastapi import Depends, HTTPException, Request, status
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 
 from app.db import get_conn_cursor
@@ -20,12 +20,59 @@ from app.models import PERMISSION_KEYS, SCOPED_PERMISSION_KEYS
 load_dotenv(Path(__file__).resolve().parents[1] / ".env")
 
 JWT_ALGORITHM = "HS256"
-JWT_SECRET = os.getenv("JWT_SECRET", "change-me-in-env")
+JWT_SECRET = os.getenv("JWT_SECRET", "").strip()
 JWT_EXPIRES_MINUTES = int(os.getenv("JWT_EXPIRES_MINUTES", "480"))
+AUTH_COOKIE_NAME = os.getenv("AUTH_COOKIE_NAME", "ivs_access_token").strip() or "ivs_access_token"
+AUTH_COOKIE_SECURE = os.getenv("AUTH_COOKIE_SECURE", "").strip().lower() in {"1", "true", "yes"}
+AUTH_DEBUG = os.getenv("AUTH_DEBUG", "0").strip().lower() in {"1", "true", "yes"}
 
 security = HTTPBearer(auto_error=False)
 _PERMISSION_KEY_PATTERN = re.compile(r"key='([^']+)'")
 _ALLOWED_DEPARTMENTS_PATTERN = re.compile(r"allowed_departments=(\[.*\])$")
+
+
+def _runtime_environment() -> str:
+    return (
+        os.getenv("APP_ENV")
+        or os.getenv("ENVIRONMENT")
+        or os.getenv("FASTAPI_ENV")
+        or os.getenv("ENV")
+        or "development"
+    ).strip().lower()
+
+
+def _is_non_development_environment() -> bool:
+    return _runtime_environment() not in {"", "dev", "development", "local", "test", "testing"}
+
+
+def _auth_debug(event: object) -> None:
+    if AUTH_DEBUG:
+        print(event)
+
+
+def validate_auth_configuration() -> None:
+    if not JWT_SECRET:
+        raise RuntimeError("JWT_SECRET must be configured.")
+    if JWT_SECRET.lower() in {"change-me-in-env", "change-me-please"}:
+        raise RuntimeError("JWT_SECRET must not use a placeholder value.")
+    if _is_non_development_environment():
+        admin_name = os.getenv("ADMIN_NAME", "").strip()
+        admin_email = os.getenv("ADMIN_EMAIL", "").strip()
+        admin_password = os.getenv("ADMIN_PASSWORD", "").strip()
+        missing = [
+            name
+            for name, value in (
+                ("ADMIN_NAME", admin_name),
+                ("ADMIN_EMAIL", admin_email),
+                ("ADMIN_PASSWORD", admin_password),
+            )
+            if not value
+        ]
+        if missing:
+            raise RuntimeError(f"Missing required auth env vars for non-development environment: {', '.join(missing)}")
+
+
+validate_auth_configuration()
 
 
 def hash_password(password: str) -> str:
@@ -97,7 +144,7 @@ def _load_permissions(cursor, user_id: int) -> list[dict[str, Any]]:
         value = row.get("permission_key") if isinstance(row, dict) else row[0]
         key, parsed_allowed = _parse_permission_repr(value)
         if key and key not in PERMISSION_KEYS:
-            print(f"[permissions] skipping unknown permission entry in auth.py: {key!r}")
+            _auth_debug(f"[permissions] skipping unknown permission entry in auth.py: {key!r}")
             continue
         if key in PERMISSION_KEYS:
             raw_allowed = row.get("allowed_departments_json") if isinstance(row, dict) else None
@@ -118,65 +165,39 @@ def _load_permissions(cursor, user_id: int) -> list[dict[str, Any]]:
     return permissions
 
 
-def get_current_user(credentials: HTTPAuthorizationCredentials | None = Depends(security)) -> dict[str, Any]:
-    print(
+def get_current_user(
+    request: Request,
+    credentials: HTTPAuthorizationCredentials | None = Depends(security),
+) -> dict[str, Any]:
+    token = ""
+    if credentials is not None and credentials.scheme.lower() == "bearer" and credentials.credentials:
+        token = credentials.credentials
+    elif request.cookies.get(AUTH_COOKIE_NAME):
+        token = str(request.cookies.get(AUTH_COOKIE_NAME) or "").strip()
+    _auth_debug(
         {
             "auth_stage": "get_current_user:start",
-            "has_credentials": credentials is not None,
-            "scheme": (credentials.scheme if credentials is not None else None),
-            "token_present": bool(credentials and credentials.credentials),
+            "has_bearer": credentials is not None and credentials.scheme.lower() == "bearer",
+            "has_cookie": bool(request.cookies.get(AUTH_COOKIE_NAME)),
         }
     )
-    if credentials is None or credentials.scheme.lower() != "bearer":
-        print(
-            {
-                "auth_stage": "get_current_user:raise",
-                "reason": "missing_or_invalid_auth_scheme",
-                "status_code": status.HTTP_401_UNAUTHORIZED,
-            }
-        )
+    if not token:
+        _auth_debug({"auth_stage": "get_current_user:raise", "reason": "missing_token"})
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Not authenticated")
 
     try:
-        payload = decode_access_token(credentials.credentials)
-        print(
-            {
-                "auth_stage": "get_current_user:token_decoded",
-                "payload_sub": payload.get("sub"),
-                "payload_user_id": payload.get("user_id"),
-                "payload_role": payload.get("role"),
-            }
-        )
+        payload = decode_access_token(token)
+        _auth_debug({"auth_stage": "get_current_user:token_decoded", "payload_user_id": payload.get("user_id")})
     except HTTPException as exc:
-        print(
-            {
-                "auth_stage": "get_current_user:raise",
-                "reason": "decode_access_token_failed",
-                "status_code": exc.status_code,
-                "detail": exc.detail,
-            }
-        )
+        _auth_debug({"auth_stage": "get_current_user:raise", "reason": "decode_access_token_failed"})
         raise
 
     raw_user_id = payload.get("user_id") or payload.get("sub")
     try:
         user_id = int(raw_user_id)
-        print(
-            {
-                "auth_stage": "get_current_user:user_id_parsed",
-                "raw_user_id": raw_user_id,
-                "user_id": user_id,
-            }
-        )
+        _auth_debug({"auth_stage": "get_current_user:user_id_parsed", "user_id": user_id})
     except Exception:
-        print(
-            {
-                "auth_stage": "get_current_user:raise",
-                "reason": "invalid_token_payload_user_id",
-                "raw_user_id": raw_user_id,
-                "status_code": status.HTTP_401_UNAUTHORIZED,
-            }
-        )
+        _auth_debug({"auth_stage": "get_current_user:raise", "reason": "invalid_token_payload_user_id"})
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid token payload")
 
     with get_conn_cursor(dictionary=True) as (_, cursor):
@@ -200,48 +221,15 @@ def get_current_user(credentials: HTTPAuthorizationCredentials | None = Depends(
             (user_id,),
         )
         user = cursor.fetchone()
-        print(
-            {
-                "auth_stage": "get_current_user:user_lookup",
-                "user_id": user_id,
-                "user_found": bool(user),
-                "linked_employee_id": (user.get("employee_id") if user else None),
-                "department": (user.get("department") if user else None),
-            }
-        )
+        _auth_debug({"auth_stage": "get_current_user:user_lookup", "user_id": user_id, "user_found": bool(user)})
         if user:
             user["permissions"] = _load_permissions(cursor, user_id)
-            print(
-                {
-                    "auth_stage": "get_current_user:permissions_loaded",
-                    "user_id": user_id,
-                    "permission_keys": [
-                        item.get("key")
-                        for item in (user.get("permissions") or [])
-                        if isinstance(item, dict)
-                    ],
-                }
-            )
+            _auth_debug({"auth_stage": "get_current_user:permissions_loaded", "user_id": user_id})
 
     if not user:
-        print(
-            {
-                "auth_stage": "get_current_user:raise",
-                "reason": "user_not_found",
-                "user_id": user_id,
-                "status_code": status.HTTP_401_UNAUTHORIZED,
-            }
-        )
+        _auth_debug({"auth_stage": "get_current_user:raise", "reason": "user_not_found", "user_id": user_id})
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="User not found")
-    print(
-        {
-            "auth_stage": "get_current_user:success",
-            "user_id": user.get("id"),
-            "role": user.get("role"),
-            "linked_employee_id": user.get("employee_id"),
-            "department": user.get("department"),
-        }
-    )
+    _auth_debug({"auth_stage": "get_current_user:success", "user_id": user.get("id"), "role": user.get("role")})
     return user
 
 
@@ -321,9 +309,9 @@ def require_permission(permission_key: str):
 
 
 def ensure_admin_seed() -> None:
-    admin_name = os.getenv("ADMIN_NAME", "Initial Admin")
-    admin_email = os.getenv("ADMIN_EMAIL", "admin@example.com")
-    admin_password = os.getenv("ADMIN_PASSWORD", "ChangeMe123!")
+    admin_name = os.getenv("ADMIN_NAME", "").strip()
+    admin_email = os.getenv("ADMIN_EMAIL", "").strip()
+    admin_password = os.getenv("ADMIN_PASSWORD", "").strip()
 
     with get_conn_cursor(dictionary=True) as (_, cursor):
         cursor.execute("SELECT COUNT(*) AS total FROM users WHERE role='admin'")
@@ -331,6 +319,10 @@ def ensure_admin_seed() -> None:
         total = int((row or {}).get("total", 0))
         if total > 0:
             return
+        if not admin_name or not admin_email or not admin_password:
+            raise RuntimeError(
+                "No admin user exists and ADMIN_NAME, ADMIN_EMAIL, ADMIN_PASSWORD must be configured to seed the first admin."
+            )
 
         password_hash = hash_password(admin_password)
         cursor.execute(
@@ -341,16 +333,4 @@ def ensure_admin_seed() -> None:
             (admin_name, admin_email, password_hash),
         )
 
-    used_default = (
-        admin_name == "Initial Admin"
-        and admin_email == "admin@example.com"
-        and admin_password == "ChangeMe123!"
-    )
-    print(
-        (
-            f"[auth-seed] Created initial admin user: {admin_email}"
-            if not used_default
-            else "[auth-seed] Created default admin user: admin@example.com / ChangeMe123! "
-            "(set ADMIN_EMAIL and ADMIN_PASSWORD in backend/.env)"
-        )
-    )
+    print(f"[auth-seed] Created initial admin user: {admin_email}")

@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useState } from "react";
-import { Download, Search, Users, ShieldCheck, Clock3, Wallet } from "lucide-react";
+import { Download, Search, Users, ShieldCheck, Clock3, Wallet, UserX } from "lucide-react";
 import { useSearchParams } from "react-router-dom";
 import { useAuth } from "@/auth/AuthContext";
 import { useDebouncedValue } from "@/hooks/useDebouncedValue";
@@ -19,7 +19,7 @@ import { Select } from "@/components/ui/Select";
 import { Spinner } from "@/components/ui/Spinner";
 import { Table } from "@/components/ui/Table";
 import { apiClient, toFileUrl } from "@/services/apiClient";
-import type { AdminAttendanceItem } from "@/types";
+import type { AdminAttendanceItem, AdminAttendanceSummary } from "@/types";
 
 type SourceFilter = "all" | "face" | "manual";
 type LateFilter = "all" | "late" | "on_time";
@@ -93,6 +93,13 @@ export function AdminAllAttendancePage() {
     includeInactive: isAdmin,
   });
   const [items, setItems] = useState<AdminAttendanceItem[]>([]);
+  const [summary, setSummary] = useState<AdminAttendanceSummary>({
+    records: 0,
+    present: 0,
+    late: 0,
+    absent: 0,
+    totalFine: 0,
+  });
   const [total, setTotal] = useState(0);
   const [page, setPage] = useState(1);
   const [limit] = useState(20);
@@ -136,41 +143,15 @@ export function AdminAllAttendancePage() {
     setPage(1);
   }, [debouncedSearch, fromDate, toDate, department, sourceFilter, lateFilter, statusFilter, sortByFineDesc]);
 
-  const filteredRows = useMemo(() => {
-    const rows = items.filter((row) => {
-      if (sourceFilter !== "all" && (row.source || "") !== sourceFilter) return false;
-      const isLate = Number(row.fine_amount || 0) > 0;
-      if (lateFilter === "late" && !isLate) return false;
-      if (lateFilter === "on_time" && isLate) return false;
-      const isPresent = String(row.status || "").toLowerCase() === "present";
-      if (statusFilter === "present" && !isPresent) return false;
-      if (statusFilter === "absent" && isPresent) return false;
-      return true;
-    });
-    return sortByFineDesc ? [...rows].sort((a, b) => Number(b.fine_amount || 0) - Number(a.fine_amount || 0)) : rows;
-  }, [items, sourceFilter, lateFilter, statusFilter, sortByFineDesc]);
-
-  const summary = useMemo(() => {
-    const present = filteredRows.filter((r) => String(r.status || "").toLowerCase() === "present").length;
-    const late = filteredRows.filter((r) => Number(r.fine_amount || 0) > 0).length;
-    const totalFine = filteredRows.reduce((sum, r) => sum + Number(r.fine_amount || 0), 0);
-    return {
-      records: filteredRows.length,
-      present,
-      late,
-      totalFine,
-    };
-  }, [filteredRows]);
-
   const selectedEmployeeStats = useMemo(() => {
     if (!selectedRow) return { presentDays: 0, lateDays: 0, totalFine: 0 };
-    const rows = filteredRows.filter((r) => r.employee.id === selectedRow.employee.id);
+    const rows = items.filter((r) => r.employee.id === selectedRow.employee.id);
     return {
-      presentDays: rows.filter((r) => String(r.status || "").toLowerCase() === "present").length,
-      lateDays: rows.filter((r) => Number(r.fine_amount || 0) > 0).length,
+      presentDays: rows.filter((r) => ["present", "late"].includes(String(r.status || "").toLowerCase())).length,
+      lateDays: rows.filter((r) => String(r.status || "").toLowerCase() === "late" || Number(r.fine_amount || 0) > 0).length,
       totalFine: rows.reduce((sum, r) => sum + Number(r.fine_amount || 0), 0),
     };
-  }, [filteredRows, selectedRow]);
+  }, [items, selectedRow]);
 
   async function loadAttendance() {
     setLoading(true);
@@ -181,17 +162,23 @@ export function AdminAllAttendancePage() {
         to: toDate || undefined,
         department: department || undefined,
         q: debouncedSearch || undefined,
+        source: sourceFilter,
+        lateness: lateFilter,
+        status: statusFilter,
+        sort: sortByFineDesc ? "fine_desc" : "recent",
         page,
         limit,
       });
       setItems(res.items);
       setTotal(res.total);
+      setSummary(res.summary);
     } catch (e) {
       const msg = e instanceof Error ? e.message : "Failed to load attendance";
       setError(msg);
       toast.error(msg);
       setItems([]);
       setTotal(0);
+      setSummary({ records: 0, present: 0, late: 0, absent: 0, totalFine: 0 });
     } finally {
       setLoading(false);
     }
@@ -199,7 +186,7 @@ export function AdminAllAttendancePage() {
 
   useEffect(() => {
     void loadAttendance();
-  }, [page, limit, fromDate, toDate, department, debouncedSearch]);
+  }, [page, limit, fromDate, toDate, department, debouncedSearch, sourceFilter, lateFilter, statusFilter, sortByFineDesc]);
 
   useEffect(() => {
     const filter = searchParams.get("filter");
@@ -246,7 +233,7 @@ export function AdminAllAttendancePage() {
     setSearch("");
   }
 
-  function exportCsv() {
+  async function exportCsv() {
     const header = [
       "AttendanceId",
       "EmployeeId",
@@ -264,7 +251,31 @@ export function AdminAllAttendancePage() {
       "EvidenceUrl",
       "CreatedAt",
     ];
-    const rows = filteredRows.map((r) =>
+    try {
+      const exportRows: AdminAttendanceItem[] = [];
+      let exportPage = 1;
+      let fetched = 0;
+      let exportTotal = 0;
+      do {
+        const res = await apiClient.getAdminAttendance({
+          from: fromDate || undefined,
+          to: toDate || undefined,
+          department: department || undefined,
+          q: debouncedSearch || undefined,
+          source: sourceFilter,
+          lateness: lateFilter,
+          status: statusFilter,
+          sort: sortByFineDesc ? "fine_desc" : "recent",
+          page: exportPage,
+          limit: 100,
+        });
+        exportRows.push(...res.items);
+        exportTotal = res.total;
+        fetched += res.items.length;
+        exportPage += 1;
+      } while (fetched < exportTotal);
+
+      const rows = exportRows.map((r) =>
       [
         r.id,
         r.employee.id,
@@ -284,15 +295,18 @@ export function AdminAllAttendancePage() {
       ]
         .map(csvEscape)
         .join(","),
-    );
-    const content = [header.join(","), ...rows].join("\n");
-    const blob = new Blob([content], { type: "text/csv;charset=utf-8;" });
-    const url = URL.createObjectURL(blob);
-    const a = document.createElement("a");
-    a.href = url;
-    a.download = `admin-attendance-${toIsoDate(new Date())}.csv`;
-    a.click();
-    URL.revokeObjectURL(url);
+      );
+      const content = [header.join(","), ...rows].join("\n");
+      const blob = new Blob([content], { type: "text/csv;charset=utf-8;" });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement("a");
+      a.href = url;
+      a.download = `admin-attendance-${toIsoDate(new Date())}.csv`;
+      a.click();
+      URL.revokeObjectURL(url);
+    } catch (e) {
+      toast.error(e instanceof Error ? e.message : "Failed to export attendance");
+    }
   }
 
   function openDrawer(row: AdminAttendanceItem) {
@@ -306,7 +320,7 @@ export function AdminAllAttendancePage() {
   }
 
   async function saveAttendanceEdit(payload: {
-    status: "Present" | "Late" | "Absent";
+    status: "Present" | "Late" | "Absent" | "Leave";
     checkin_time: string | null;
     source: "face" | "manual";
     note: string;
@@ -334,10 +348,11 @@ export function AdminAllAttendancePage() {
     <div className="mx-auto w-full max-w-7xl space-y-5">
       <PageHeader title="All Attendance" subtitle="Clean, filterable attendance view for admins." />
 
-      <div className="grid gap-4 sm:grid-cols-2 xl:grid-cols-4">
+      <div className="grid gap-4 sm:grid-cols-2 xl:grid-cols-5">
         <SummaryCard title="Records" value={summary.records} icon={<Users className="h-5 w-5" />} gradient="bg-gradient-to-br from-sky-500 via-blue-600 to-indigo-700" />
         <SummaryCard title="Present" value={summary.present} icon={<ShieldCheck className="h-5 w-5" />} gradient="bg-gradient-to-br from-emerald-500 via-green-600 to-teal-700" />
         <SummaryCard title="Late" value={summary.late} icon={<Clock3 className="h-5 w-5" />} gradient="bg-gradient-to-br from-amber-500 via-orange-600 to-yellow-700" />
+        <SummaryCard title="Absent" value={summary.absent} icon={<UserX className="h-5 w-5" />} gradient="bg-gradient-to-br from-rose-500 via-red-600 to-pink-700" />
         <SummaryCard title="Total Fine" value={`PKR ${summary.totalFine.toFixed(2)}`} icon={<Wallet className="h-5 w-5" />} gradient="bg-gradient-to-br from-rose-500 via-red-600 to-pink-700" />
       </div>
 
@@ -350,7 +365,7 @@ export function AdminAllAttendancePage() {
               <Button size="sm" variant="secondary" onClick={applyMonth}>This Month</Button>
               <Button size="sm" variant="ghost" onClick={resetFilters}>Reset</Button>
             </div>
-            <Button size="sm" variant="secondary" onClick={exportCsv} disabled={!filteredRows.length}>
+            <Button size="sm" variant="secondary" onClick={() => void exportCsv()} disabled={!summary.records}>
               <Download className="h-4 w-4" /> Export CSV
             </Button>
           </div>
@@ -391,11 +406,11 @@ export function AdminAllAttendancePage() {
           </div>
         )}
         {error && <Alert variant="error">{error}</Alert>}
-        {!loading && !error && !filteredRows.length && (
+        {!loading && !error && !items.length && (
           <EmptyState title="No attendance found" message="Adjust filters or try a different date range." />
         )}
 
-        {!!filteredRows.length && (
+        {!!items.length && (
           <>
             <Table stickyHeader zebra hoverRows>
               <thead>
@@ -415,8 +430,8 @@ export function AdminAllAttendancePage() {
                 </tr>
               </thead>
               <tbody>
-                {filteredRows.map((row) => {
-                  const late = Number(row.fine_amount || 0) > 0;
+                {items.map((row) => {
+                  const late = String(row.status || "").toLowerCase() === "late" || Number(row.fine_amount || 0) > 0;
                   return (
                     <tr key={row.id}>
                       <td><Avatar name={row.employee.name} src={row.employee.photo_url || ""} /></td>
@@ -426,7 +441,7 @@ export function AdminAllAttendancePage() {
                       <td><Badge variant={row.employee.role === "admin" ? "admin" : "user"}>{row.employee.role}</Badge></td>
                       <td>{row.date}</td>
                       <td>{format12HourTime(row.checkin_time)}</td>
-                      <td><Badge variant={String(row.status || "").toLowerCase() === "present" ? "success" : "warn"}>{row.status}</Badge></td>
+                      <td><Badge variant={["present", "late"].includes(String(row.status || "").toLowerCase()) ? (late ? "warn" : "success") : "default"}>{row.status}</Badge></td>
                       <td>{late ? <Badge variant="warn">{Number(row.late_minutes ?? 0)} min</Badge> : <span className="text-xs text-[rgb(var(--muted))]">On time</span>}</td>
                       <td>{Number(row.fine_amount || 0).toFixed(2)}</td>
                       <td>

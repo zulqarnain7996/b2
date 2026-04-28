@@ -18,8 +18,10 @@ import { Button } from "@/components/ui/Button";
 import { Card } from "@/components/ui/Card";
 import { CardSkeleton } from "@/components/ui/CardSkeleton";
 import { EmptyState } from "@/components/ui/EmptyState";
+import { Input } from "@/components/ui/Input";
 import { Modal } from "@/components/ui/Modal";
 import { Select } from "@/components/ui/Select";
+import { Textarea } from "@/components/ui/Textarea";
 import { useDepartments } from "@/hooks/useDepartments";
 import { apiClient, toFileUrl } from "@/services/apiClient";
 import { localYmd, sameLocalDay, startOfMonthLocal } from "@/utils/date";
@@ -33,7 +35,7 @@ type DayCell = {
   data: MonthlyAttendanceCalendarDay | null;
 };
 
-type VisualStatus = "present" | "late" | "absent" | "not_marked" | "off" | "pre_join";
+type VisualStatus = "present" | "late" | "absent" | "leave" | "not_marked" | "off" | "pre_join";
 
 const WEEKDAYS = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
 
@@ -54,6 +56,7 @@ function formatTime(value: string | null): string {
 function resolveVisualStatus(cell: DayCell, todayIso: string): VisualStatus {
   if (cell.data?.status === "pre_join") return "pre_join";
   if (cell.data?.status === "off") return "off";
+  if (cell.data?.status === "leave") return "leave";
   if (cell.data?.status === "present") {
     if (Number(cell.data.fine_amount || 0) > 0 || Number(cell.data.late_minutes || 0) > 0) {
       return "late";
@@ -72,6 +75,8 @@ function statusMeta(status: VisualStatus) {
       return { label: "Late", cardClass: "border-amber-300/35 bg-amber-500/10 dark:bg-amber-500/12", dotClass: "bg-amber-500" };
     case "absent":
       return { label: "Absent", cardClass: "border-rose-300/35 bg-rose-500/10 dark:bg-rose-500/12", dotClass: "bg-rose-500" };
+    case "leave":
+      return { label: "Leave", cardClass: "border-cyan-300/35 bg-cyan-500/10 dark:bg-cyan-500/12", dotClass: "bg-cyan-500" };
     case "off":
       return { label: "Off", cardClass: "border-violet-300/35 bg-violet-500/10 dark:bg-violet-500/12", dotClass: "bg-violet-500" };
     case "pre_join":
@@ -102,6 +107,7 @@ function StatusPill({ status }: { status: VisualStatus }) {
     present: "border border-emerald-300/60 bg-emerald-500/12 text-emerald-700 dark:text-emerald-200",
     late: "border border-amber-300/60 bg-amber-500/12 text-amber-700 dark:text-amber-200",
     absent: "border border-rose-300/60 bg-rose-500/12 text-rose-700 dark:text-rose-200",
+    leave: "border border-cyan-300/60 bg-cyan-500/12 text-cyan-700 dark:text-cyan-200",
     off: "border border-violet-300/60 bg-violet-500/12 text-violet-700 dark:text-violet-200",
     pre_join: "border border-[rgb(var(--border))] bg-[rgb(var(--surface-muted))] text-[rgb(var(--text-soft))]",
     not_marked: "border border-[rgb(var(--border))] bg-[rgb(var(--surface-muted))] text-[rgb(var(--text-soft))]",
@@ -144,6 +150,13 @@ export function MonthlyAttendancePage() {
   const [previewOpen, setPreviewOpen] = useState(false);
   const [captureStep, setCaptureStep] = useState<"picker" | "live" | "preview">("picker");
   const [cameraMessage, setCameraMessage] = useState("");
+  const [adminEditOpen, setAdminEditOpen] = useState(false);
+  const [leaveModalOpen, setLeaveModalOpen] = useState(false);
+  const [actionCellIso, setActionCellIso] = useState("");
+  const [actionCheckinTime, setActionCheckinTime] = useState("09:00");
+  const [actionNote, setActionNote] = useState("");
+  const [actionError, setActionError] = useState("");
+  const [actionSaving, setActionSaving] = useState(false);
 
   const todayIso = useMemo(() => localYmd(now), [now]);
   const employeeOptions = useMemo(() => {
@@ -315,11 +328,11 @@ export function MonthlyAttendancePage() {
   }, [previewUrl]);
 
   useEffect(() => {
-    if (!previewOpen || captureStep !== "live" || !videoRef.current || !streamRef.current) return;
+    if ((!previewOpen && !adminEditOpen) || captureStep !== "live" || !videoRef.current || !streamRef.current) return;
     const video = videoRef.current;
     video.srcObject = streamRef.current;
     void video.play().catch(() => {});
-  }, [captureStep, previewOpen]);
+  }, [adminEditOpen, captureStep, previewOpen]);
 
   const monthDaysMap = useMemo(() => {
     const map = new Map<string, MonthlyAttendanceCalendarDay>();
@@ -363,10 +376,16 @@ export function MonthlyAttendancePage() {
     const present = monthDays.filter((d) => d.status === "present" && Number(d.fine_amount || 0) <= 0).length;
     const late = monthDays.filter((d) => d.status === "present" && Number(d.fine_amount || 0) > 0).length;
     const absent = monthDays.filter((d) => d.status === "absent").length;
+    const leave = monthDays.filter((d) => d.status === "leave").length;
     const off = monthDays.filter((d) => d.status === "off").length;
     const totalFine = monthDays.reduce((acc, day) => acc + Number(day.fine_amount || 0), 0);
-    return { present, late, absent, off, totalFine };
+    return { present, late, absent, leave, off, totalFine };
   }, [monthDays]);
+
+  const activeActionCell = useMemo(
+    () => calendarCells.find((cell) => cell.iso === actionCellIso) ?? null,
+    [actionCellIso, calendarCells],
+  );
 
   const todayRecord = useMemo(() => monthDays.find((d) => d.date === todayIso) ?? null, [monthDays, todayIso]);
   const todayStatus = useMemo(() => {
@@ -418,10 +437,53 @@ export function MonthlyAttendancePage() {
     }
   }
 
+  function resetCaptureState() {
+    setSelectedSelfieFile(null);
+    if (previewUrl) URL.revokeObjectURL(previewUrl);
+    setPreviewUrl("");
+    setCaptureStep("picker");
+    setCameraMessage("");
+    stopCameraStream();
+  }
+
   function onPickSelfie() {
+    resetCaptureState();
+    setActionError("");
     setCameraMessage("");
     setCaptureStep("picker");
     setPreviewOpen(true);
+  }
+
+  function openAdminEdit(cell: DayCell) {
+    resetCaptureState();
+    setActionCellIso(cell.iso);
+    setActionNote(cell.data?.note || "");
+    setActionCheckinTime(selectedEmployee?.shiftStartTime?.slice(0, 5) || "09:00");
+    setActionError("");
+    setAdminEditOpen(true);
+  }
+
+  function openLeaveModal(cell: DayCell) {
+    setActionCellIso(cell.iso);
+    setActionNote(cell.data?.note || "");
+    setActionError("");
+    setLeaveModalOpen(true);
+  }
+
+  function closeAdminEdit() {
+    setAdminEditOpen(false);
+    setActionCellIso("");
+    setActionCheckinTime(selectedEmployee?.shiftStartTime?.slice(0, 5) || "09:00");
+    setActionNote("");
+    setActionError("");
+    resetCaptureState();
+  }
+
+  function closeLeaveModal() {
+    setLeaveModalOpen(false);
+    setActionCellIso("");
+    setActionNote("");
+    setActionError("");
   }
 
   async function openLiveCamera() {
@@ -492,12 +554,7 @@ export function MonthlyAttendancePage() {
       });
       toast.success(`Attendance marked at ${formatTime(res.attendance.checkin_time)}.`);
       setPreviewOpen(false);
-      setSelectedSelfieFile(null);
-      if (previewUrl) URL.revokeObjectURL(previewUrl);
-      setPreviewUrl("");
-      setCaptureStep("picker");
-      setCameraMessage("");
-      stopCameraStream();
+      resetCaptureState();
       await loadMonth(currentMonth, activeAttendanceEmployeeId);
     } catch (e) {
       const msg = e instanceof Error ? e.message : "Failed to submit selfie proof.";
@@ -510,6 +567,96 @@ export function MonthlyAttendancePage() {
       setError(msg);
     } finally {
       setUploading(false);
+    }
+  }
+
+  async function submitAdminEdit() {
+    if (!selectedEmployeeId) {
+      const msg = "Select an employee before updating attendance.";
+      setActionError(msg);
+      toast.error(msg);
+      return;
+    }
+    if (!activeActionCell) {
+      const msg = "Select a calendar day before updating attendance.";
+      setActionError(msg);
+      toast.error(msg);
+      return;
+    }
+    if (!selectedSelfieFile) {
+      const msg = "Capture a proof photo before saving attendance.";
+      setActionError(msg);
+      toast.error(msg);
+      return;
+    }
+    if (!actionCheckinTime) {
+      const msg = "Check-in time is required.";
+      setActionError(msg);
+      toast.error(msg);
+      return;
+    }
+
+    setActionSaving(true);
+    setActionError("");
+    try {
+      const res = await apiClient.adminAdjustMonthlyAttendance(selectedSelfieFile, {
+        employee_id: selectedEmployeeId,
+        date: activeActionCell.iso,
+        checkin_time: actionCheckinTime,
+        note: actionNote.trim() || undefined,
+        device_info: navigator.userAgent,
+      });
+      toast.success(`${res.attendance.status} saved for ${activeActionCell.iso}.`);
+      closeAdminEdit();
+      await loadMonth(currentMonth, activeAttendanceEmployeeId);
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : "Failed to update attendance.";
+      setActionError(msg);
+      toast.error(msg);
+    } finally {
+      setActionSaving(false);
+    }
+  }
+
+  async function submitLeave() {
+    if (!selectedEmployeeId) {
+      const msg = "Select an employee before marking leave.";
+      setActionError(msg);
+      toast.error(msg);
+      return;
+    }
+    if (!activeActionCell) {
+      const msg = "Select a calendar day before marking leave.";
+      setActionError(msg);
+      toast.error(msg);
+      return;
+    }
+
+    const normalizedNote = actionNote.trim();
+    if (!normalizedNote) {
+      const msg = "Leave note is required.";
+      setActionError(msg);
+      toast.error(msg);
+      return;
+    }
+
+    setActionSaving(true);
+    setActionError("");
+    try {
+      await apiClient.adminMarkMonthlyLeave({
+        employee_id: selectedEmployeeId,
+        date: activeActionCell.iso,
+        note: normalizedNote,
+      });
+      toast.success(`Leave marked for ${activeActionCell.iso}.`);
+      closeLeaveModal();
+      await loadMonth(currentMonth, activeAttendanceEmployeeId);
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : "Failed to mark leave.";
+      setActionError(msg);
+      toast.error(msg);
+    } finally {
+      setActionSaving(false);
     }
   }
 
@@ -628,10 +775,11 @@ export function MonthlyAttendancePage() {
 
       {error ? <Alert variant="error">{error}</Alert> : null}
 
-      <div className="grid gap-3 md:grid-cols-4">
+      <div className="grid gap-3 md:grid-cols-3 xl:grid-cols-6">
         <SummaryCard title="Present" value={summary.present} subtitle="On-time days" icon={<CheckCircle2 className="h-4 w-4" />} toneClass="border-emerald-200 bg-emerald-50 text-emerald-700" />
         <SummaryCard title="Late" value={summary.late} subtitle="Late arrivals" icon={<Clock3 className="h-4 w-4" />} toneClass="border-amber-200 bg-amber-50 text-amber-700" />
         <SummaryCard title="Absent" value={summary.absent} subtitle="Past missed days" icon={<CircleAlert className="h-4 w-4" />} toneClass="border-rose-200 bg-rose-50 text-rose-700" />
+        <SummaryCard title="Leave" value={summary.leave} subtitle="Approved leave days" icon={<CalendarDays className="h-4 w-4" />} toneClass="border-cyan-200 bg-cyan-50 text-cyan-700" />
         <SummaryCard title="Off" value={summary.off} subtitle="Weekly holidays" icon={<CalendarDays className="h-4 w-4" />} toneClass="border-violet-200 bg-violet-50 text-violet-700" />
         <SummaryCard title="Total Fine" value={`PKR ${summary.totalFine.toFixed(2)}`} subtitle="This month" icon={<Wallet className="h-4 w-4" />} toneClass="border-sky-200 bg-sky-50 text-sky-700" />
       </div>
@@ -643,7 +791,7 @@ export function MonthlyAttendancePage() {
         actions={
           <div className="flex flex-wrap items-center justify-end gap-2">
             <div className="theme-surface-muted hidden items-center gap-2 rounded-2xl border px-3 py-2 text-xs text-[rgb(var(--text-soft))] md:flex">
-              {(["present", "late", "absent", "off", "pre_join", "not_marked"] as const).map((status) => {
+              {(["present", "late", "absent", "leave", "off", "pre_join", "not_marked"] as const).map((status) => {
                 const meta = statusMeta(status);
                 return (
                   <span key={status} className="inline-flex items-center gap-1.5">
@@ -679,7 +827,7 @@ export function MonthlyAttendancePage() {
         {!loading && monthDays.length > 0 ? (
           <div className="space-y-3">
             <div className="grid grid-cols-2 gap-2 md:hidden">
-              {(["present", "late", "absent", "off", "pre_join", "not_marked"] as const).map((status) => {
+              {(["present", "late", "absent", "leave", "off", "pre_join", "not_marked"] as const).map((status) => {
                 const meta = statusMeta(status);
                 return (
                   <div key={status} className="theme-surface-muted inline-flex items-center gap-2 rounded-xl border px-3 py-2 text-xs text-[rgb(var(--text-soft))]">
@@ -705,6 +853,11 @@ export function MonthlyAttendancePage() {
                 const lateMinutes = Number(cell.data?.late_minutes ?? 0);
                 const fineAmount = Number(cell.data?.fine_amount ?? 0);
                 const hasEvidence = !!cell.data?.evidence_photo_url;
+                const canAdminAdjustDay =
+                  isAdmin &&
+                  canViewManagedMonthly &&
+                  cell.inMonth &&
+                  (status === "absent" || status === "not_marked");
 
                 return (
                   <div
@@ -742,6 +895,13 @@ export function MonthlyAttendancePage() {
                       </div>
                     </div>
 
+                    {cell.data?.note ? (
+                      <div className="mt-3 rounded-xl border border-[rgb(var(--border))] bg-[rgb(var(--surface-elevated))] px-3 py-2">
+                        <p className="text-[10px] font-semibold uppercase tracking-[0.12em] text-[rgb(var(--text-soft))]">Note</p>
+                        <p className="mt-1 text-xs text-[rgb(var(--text))]">{cell.data.note}</p>
+                      </div>
+                    ) : null}
+
                     {hasEvidence ? (
                       <div className="mt-3 space-y-2">
                         <div className="flex items-center justify-between">
@@ -758,6 +918,18 @@ export function MonthlyAttendancePage() {
                         <span className="inline-flex h-9 items-center justify-center rounded-xl border border-dashed border-[rgb(var(--border))] bg-[rgb(var(--surface-elevated))] px-3 text-[10px] text-[rgb(var(--text-soft))]">No photo</span>
                       </div>
                     )}
+
+                    {canAdminAdjustDay ? (
+                      <div className="mt-3 grid gap-2">
+                        <Button size="sm" onClick={() => openAdminEdit(cell)}>
+                          <Camera className="h-4 w-4" />
+                          Edit With Proof
+                        </Button>
+                        <Button size="sm" variant="secondary" onClick={() => openLeaveModal(cell)}>
+                          Mark Leave
+                        </Button>
+                      </div>
+                    ) : null}
                   </div>
                 );
               })}
@@ -772,9 +944,7 @@ export function MonthlyAttendancePage() {
         onClose={() => {
           if (uploading) return;
           setPreviewOpen(false);
-          setCaptureStep("picker");
-          setCameraMessage("");
-          stopCameraStream();
+          resetCaptureState();
         }}
         width="md"
         footer={
@@ -837,6 +1007,121 @@ export function MonthlyAttendancePage() {
             </div>
           </div>
         )}
+      </Modal>
+
+      <Modal
+        isOpen={adminEditOpen}
+        title={activeActionCell ? `Edit Absent Day · ${activeActionCell.iso}` : "Edit Absent Day"}
+        onClose={actionSaving ? () => {} : closeAdminEdit}
+        width="md"
+        footer={
+          captureStep === "live" ? (
+            <>
+              <Button onClick={captureFromVideo} disabled={actionSaving}>
+                <Camera className="h-4 w-4" />
+                Capture
+              </Button>
+              <Button variant="secondary" onClick={() => {
+                stopCameraStream();
+                setCaptureStep("picker");
+              }} disabled={actionSaving}>
+                Cancel Camera
+              </Button>
+            </>
+          ) : (
+            <>
+              <Button variant="secondary" onClick={closeAdminEdit} disabled={actionSaving}>
+                Cancel
+              </Button>
+              <Button onClick={() => void submitAdminEdit()} disabled={!selectedSelfieFile || !actionCheckinTime || actionSaving}>
+                {actionSaving ? "Saving..." : "Save Attendance"}
+              </Button>
+            </>
+          )
+        }
+      >
+        <div className="space-y-4">
+          <div className="grid gap-4">
+            <Input
+              label="Check-in Time"
+              type="time"
+              value={actionCheckinTime}
+              onChange={(event) => setActionCheckinTime(event.target.value)}
+            />
+            <Textarea
+              label="Admin Note"
+              rows={3}
+              value={actionNote}
+              onChange={(event) => setActionNote(event.target.value)}
+              placeholder="Optional note for the attendance correction"
+            />
+          </div>
+
+          {captureStep === "live" ? (
+            <div className="space-y-3">
+              <div className="overflow-hidden rounded-2xl border border-[rgb(var(--border))] bg-black">
+                <video ref={videoRef} className="h-72 w-full object-cover" autoPlay playsInline muted />
+              </div>
+              <p className="text-xs text-[rgb(var(--text-soft))]">Capture the employee photo as proof for this correction.</p>
+              <canvas ref={canvasRef} className="hidden" />
+            </div>
+          ) : previewUrl ? (
+            <div className="space-y-3">
+              <img src={previewUrl} alt="Attendance proof preview" className="h-72 w-full rounded-2xl border border-[rgb(var(--border))] object-cover" />
+              <div className="flex gap-2">
+                <Button variant="secondary" onClick={() => void openLiveCamera()} disabled={actionSaving}>
+                  Retake
+                </Button>
+              </div>
+            </div>
+          ) : (
+            <div className="space-y-4">
+              <div className="theme-surface-muted rounded-2xl border p-4">
+                <p className="text-sm font-semibold text-[rgb(var(--text))]">Proof photo required</p>
+                <p className="mt-1 text-sm text-[rgb(var(--text-soft))]">Take a fresh photo, then save. The backend will recalculate status and fine from the check-in time.</p>
+              </div>
+              {cameraMessage ? <Alert variant="info">{cameraMessage}</Alert> : null}
+              <Button onClick={() => void openLiveCamera()} disabled={actionSaving}>
+                <Camera className="h-4 w-4" />
+                Open Camera
+              </Button>
+            </div>
+          )}
+
+          {actionError ? <Alert variant="error">{actionError}</Alert> : null}
+        </div>
+      </Modal>
+
+      <Modal
+        isOpen={leaveModalOpen}
+        title={activeActionCell ? `Mark Leave · ${activeActionCell.iso}` : "Mark Leave"}
+        onClose={actionSaving ? () => {} : closeLeaveModal}
+        width="md"
+        footer={
+          <>
+            <Button variant="secondary" onClick={closeLeaveModal} disabled={actionSaving}>
+              Cancel
+            </Button>
+            <Button onClick={() => void submitLeave()} disabled={actionSaving}>
+              {actionSaving ? "Saving..." : "Save Leave"}
+            </Button>
+          </>
+        }
+      >
+        <div className="space-y-4">
+          <div className="theme-surface-muted rounded-2xl border p-4">
+            <p className="text-sm font-semibold text-[rgb(var(--text))]">Leave days do not carry a fine</p>
+            <p className="mt-1 text-sm text-[rgb(var(--text-soft))]">Add the reason so this day is visible as approved leave instead of absence.</p>
+          </div>
+          <Textarea
+            label="Leave Note"
+            rows={4}
+            value={actionNote}
+            onChange={(event) => setActionNote(event.target.value)}
+            placeholder="Reason for leave"
+          />
+          {actionError ? <Alert variant="error">{actionError}</Alert> : null}
+        </div>
       </Modal>
     </div>
   );

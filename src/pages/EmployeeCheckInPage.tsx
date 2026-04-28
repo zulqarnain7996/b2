@@ -124,8 +124,8 @@ export function EmployeeCheckInPage() {
   async function loadTodayAttendance() {
     setLoadingToday(true);
     try {
-      const res = await apiClient.getMyHistory();
-      const todayRow = (res.records || []).find((row) => String(row.date || "") === todayIsoDate());
+      const res = await apiClient.getMyTodayAttendance();
+      const todayRow = res.record && String(res.record.date || "") === todayIsoDate() ? res.record : null;
       if (todayRow) {
         setRows([mapAttendanceRow(todayRow)]);
         setTodayMarked(true);

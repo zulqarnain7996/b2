@@ -19,7 +19,6 @@ type AuthContextValue = {
 };
 
 const AuthContext = createContext<AuthContextValue | undefined>(undefined);
-const TOKEN_KEY = "authToken";
 
 export function AuthProvider({ children }: { children: ReactNode }) {
   const [user, setUser] = useState<AuthUser | null>(null);
@@ -29,22 +28,15 @@ export function AuthProvider({ children }: { children: ReactNode }) {
   const [loading, setLoading] = useState(true);
 
   useEffect(() => {
-    const savedToken = sessionStorage.getItem(TOKEN_KEY);
-    if (!savedToken) {
-      setLoading(false);
-      return;
-    }
-
-    setAccessToken(savedToken);
-    setToken(savedToken);
-    setLoginEventKey(null);
-    setRefreshEventKey(`refresh:${Date.now()}:${savedToken.slice(0, 12)}`);
-
     apiClient
       .getMe()
-      .then((res) => setUser(res.user))
+      .then((res) => {
+        setUser(res.user);
+        setToken("cookie-session");
+        setLoginEventKey(null);
+        setRefreshEventKey(`refresh:${Date.now()}:${res.user.id}`);
+      })
       .catch(() => {
-        sessionStorage.removeItem(TOKEN_KEY);
         setAccessToken(null);
         setToken(null);
         setLoginEventKey(null);
@@ -72,9 +64,8 @@ export function AuthProvider({ children }: { children: ReactNode }) {
 
   async function login(email: string, password: string) {
     const res = await apiClient.login({ email, password });
-    sessionStorage.setItem(TOKEN_KEY, res.token);
-    setAccessToken(res.token);
-    setToken(res.token);
+    setAccessToken(null);
+    setToken("cookie-session");
     setLoginEventKey(`login:${Date.now()}:${res.user.id}`);
     setRefreshEventKey(null);
     try {
@@ -86,18 +77,20 @@ export function AuthProvider({ children }: { children: ReactNode }) {
   }
 
   function logout() {
-    sessionStorage.removeItem(TOKEN_KEY);
-    setAccessToken(null);
-    setToken(null);
-    setLoginEventKey(null);
-    setRefreshEventKey(null);
-    setUser(null);
+    void apiClient.logout().catch(() => undefined).finally(() => {
+      setAccessToken(null);
+      setToken(null);
+      setLoginEventKey(null);
+      setRefreshEventKey(null);
+      setUser(null);
+    });
   }
 
   async function refreshMe() {
-    if (!token && !sessionStorage.getItem(TOKEN_KEY)) return;
+    if (!token && !user) return;
     const res = await apiClient.getMe();
     setUser(res.user);
+    setToken("cookie-session");
   }
 
   const value = useMemo<AuthContextValue>(

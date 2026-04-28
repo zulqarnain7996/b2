@@ -98,24 +98,26 @@ export type MyHistoryResponse = {
 
 export type MonthlyAttendanceDay = {
   date: string;
-  status: "Present" | "Late" | "Absent" | "Not Marked" | "Off" | "Pre-Join";
+  status: "Present" | "Late" | "Absent" | "Leave" | "Not Marked" | "Off" | "Pre-Join";
   checkInTime: string | null;
   lateMinutes?: number;
   source: "face" | "manual" | null;
   evidencePhotoUrl?: string | null;
   confidence: number;
   fineAmount: number;
+  note?: string | null;
 };
 
 export type MonthlyAttendanceCalendarDay = {
   date: string;
   weekday: string;
-  status: "present" | "absent" | "not_marked" | "off" | "pre_join";
+  status: "present" | "absent" | "leave" | "not_marked" | "off" | "pre_join";
   checkin_time: string | null;
   late_minutes?: number;
   fine_amount: number;
   source: "face" | "manual" | null;
   evidence_photo_url: string | null;
+  note?: string | null;
 };
 
 export type AuditLog = {
@@ -193,6 +195,48 @@ export type AdminAttendanceItem = {
     is_active: boolean;
     photo_url?: string | null;
   };
+};
+
+export type AdminAttendanceSummary = {
+  records: number;
+  present: number;
+  late: number;
+  absent: number;
+  totalFine: number;
+};
+
+export type AdminAttendanceResponse = {
+  items: AdminAttendanceItem[];
+  total: number;
+  page: number;
+  limit: number;
+  summary: AdminAttendanceSummary;
+};
+
+export type AdminDashboardSummaryResponse = {
+  ok: boolean;
+  summary: {
+    totalEmployees: number;
+    activeEmployees: number;
+    presentToday: number;
+    lateToday: number;
+    absentToday: number;
+    presentRatePct: number;
+    monthFineTotal: number;
+  };
+  weeklyAttendance: {
+    labels: string[];
+    values: number[];
+  };
+  departmentStats: Array<{
+    name: string;
+    rate: number;
+  }>;
+  topLatecomers: Array<{
+    employeeId: string;
+    name: string;
+    checkInTime: string | null;
+  }>;
 };
 
 export type AdminAttendanceEmployeeReport = {

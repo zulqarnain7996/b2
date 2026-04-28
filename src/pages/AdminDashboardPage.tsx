@@ -35,7 +35,7 @@ import { Modal } from "@/components/ui/Modal";
 import { TableSkeleton } from "@/components/ui/TableSkeleton";
 import { useTheme } from "@/theme/ThemeContext";
 import { apiClient } from "@/services/apiClient";
-import type { AttendanceRecord, AuditLog, Employee, Notice } from "@/types";
+import type { AdminDashboardSummaryResponse, AuditLog, Notice } from "@/types";
 
 ChartJS.register(ArcElement, CategoryScale, LinearScale, PointElement, LineElement, Tooltip, Legend);
 
@@ -48,24 +48,6 @@ function classNames(...v: Array<string | false | null | undefined>) {
 function safePct(n: number, d: number) {
   if (!d) return 0;
   return Math.max(0, Math.min(100, Math.round((n / d) * 100)));
-}
-
-function toMs(v: unknown): number | null {
-  if (!v) return null;
-  if (typeof v === "number") return v;
-  if (typeof v === "string") {
-    const t = Date.parse(v);
-    if (!Number.isNaN(t)) return t;
-  }
-  return null;
-}
-
-function niceDateLabel(d: Date) {
-  try {
-    return new Intl.DateTimeFormat(undefined, { weekday: "short", month: "short", day: "2-digit" }).format(d);
-  } catch {
-    return d.toDateString();
-  }
 }
 
 function onCardKeyDown(event: React.KeyboardEvent<HTMLElement>, action: () => void) {
@@ -188,11 +170,12 @@ export function AdminDashboardPage() {
   const toast = useToast();
   const { theme } = useTheme();
 
-  const [employees, setEmployees] = useState<Employee[]>([]);
-  const [attendance, setAttendance] = useState<AttendanceRecord[]>([]);
+  const [dashboardSummary, setDashboardSummary] = useState<AdminDashboardSummaryResponse["summary"] | null>(null);
+  const [weeklyAttendance, setWeeklyAttendance] = useState<AdminDashboardSummaryResponse["weeklyAttendance"]>({ labels: [], values: [] });
+  const [departmentStats, setDepartmentStats] = useState<AdminDashboardSummaryResponse["departmentStats"]>([]);
+  const [topLatecomers, setTopLatecomers] = useState<AdminDashboardSummaryResponse["topLatecomers"]>([]);
   const [logs, setLogs] = useState<AuditLog[]>([]);
   const [notices, setNotices] = useState<Notice[]>([]);
-  const [monthFineTotal, setMonthFineTotal] = useState(0);
   const [loading, setLoading] = useState(true);
   const [selectedNotice, setSelectedNotice] = useState<Notice | null>(null);
   const [showWelcome, setShowWelcome] = useState(false);
@@ -213,32 +196,18 @@ export function AdminDashboardPage() {
     async function load() {
       setLoading(true);
       try {
-        const [empRes, attendanceRes, logsRes, noticesRes] = await Promise.all([
-          apiClient.getEmployees(),
-          apiClient.getTodayAttendance(),
+        const [dashboardRes, logsRes, noticesRes] = await Promise.all([
+          apiClient.getAdminDashboardSummary(),
           apiClient.getLogs(),
           apiClient.getNotices(),
         ]);
         if (!mounted) return;
-        setEmployees(empRes.employees);
-        setAttendance(attendanceRes.records);
+        setDashboardSummary(dashboardRes.summary);
+        setWeeklyAttendance(dashboardRes.weeklyAttendance);
+        setDepartmentStats(dashboardRes.departmentStats);
+        setTopLatecomers(dashboardRes.topLatecomers);
         setLogs(logsRes.logs);
         setNotices(noticesRes.notices);
-
-        const now = new Date();
-        const from = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, "0")}-01`;
-        const to = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, "0")}-${String(now.getDate()).padStart(2, "0")}`;
-        let page = 1;
-        const limit = 100;
-        let sum = 0;
-        let total = 0;
-        do {
-          const monthly = await apiClient.getAdminAttendance({ from, to, page, limit });
-          sum += (monthly.items || []).reduce((acc, row) => acc + Number(row.fine_amount || 0), 0);
-          total = Number(monthly.total || 0);
-          page += 1;
-        } while ((page - 1) * limit < total);
-        if (mounted) setMonthFineTotal(sum);
       } catch (error) {
         toast.error(error instanceof Error ? error.message : "Failed to load dashboard");
       } finally {
@@ -261,77 +230,19 @@ export function AdminDashboardPage() {
     }
   }, [user]);
 
-  const activeEmployees = useMemo(() => employees.filter((e) => e.isActive).length, [employees]);
-  const presentToday = useMemo(
-    () => attendance.filter((r) => String(r.status || "").toLowerCase() === "present").length,
-    [attendance],
-  );
-  const lateToday = useMemo(() => attendance.filter((r) => Number(r.fineAmount || 0) > 0).length, [attendance]);
-  const totalFineToday = useMemo(() => attendance.reduce((sum, r) => sum + Number(r.fineAmount || 0), 0), [attendance]);
-  const absentToday = Math.max(0, activeEmployees - presentToday);
-  const presentPct = useMemo(() => safePct(presentToday, Math.max(1, activeEmployees)), [presentToday, activeEmployees]);
-
-  const weeklyAttendanceData = useMemo(() => {
-    const map = new Map<string, number>();
-    for (const r of attendance) {
-      const key = r.date || "";
-      if (!key) continue;
-      map.set(key, (map.get(key) || 0) + 1);
-    }
-    const labels = Array.from(map.keys()).sort();
-    const last = labels.slice(-7);
-    if (!last.length) {
-      const days: string[] = [];
-      const values: number[] = [];
-      const now = new Date();
-      for (let i = 6; i >= 0; i--) {
-        const d = new Date(now);
-        d.setDate(now.getDate() - i);
-        days.push(niceDateLabel(d));
-        values.push(i === 0 ? attendance.length : 0);
-      }
-      return { labels: days, values };
-    }
-    return { labels: last, values: last.map((d) => map.get(d) || 0) };
-  }, [attendance]);
-
-  const departmentStats = useMemo(() => {
-    const stats = new Map<string, { total: number; present: number }>();
-    employees.forEach((e) => {
-      const dept = e.department || "Unknown";
-      const row = stats.get(dept) || { total: 0, present: 0 };
-      row.total += 1;
-      if (attendance.some((a) => a.employeeId === e.id && String(a.status).toLowerCase() === "present")) {
-        row.present += 1;
-      }
-      stats.set(dept, row);
-    });
-    return Array.from(stats.entries())
-      .map(([name, row]) => ({ name, rate: row.total ? Math.round((row.present / row.total) * 100) : 0 }))
-      .sort((a, b) => b.rate - a.rate)
-      .slice(0, 5);
-  }, [employees, attendance]);
-
-  const topLatecomers = useMemo(() => {
-    return attendance
-      .filter((r) => Number(r.fineAmount || 0) > 0)
-      .map((r) => ({
-        employeeId: r.employeeId,
-        name: r.name || r.employeeId,
-        checkInTime: r.checkInTime,
-        ts: toMs(r.checkInTime) ?? 0,
-      }))
-      .sort((a, b) => (b.ts || 0) - (a.ts || 0))
-      .slice(0, 5);
-  }, [attendance]);
+  const activeEmployees = dashboardSummary?.activeEmployees ?? 0;
+  const presentToday = dashboardSummary?.presentToday ?? 0;
+  const lateToday = dashboardSummary?.lateToday ?? 0;
+  const absentToday = dashboardSummary?.absentToday ?? 0;
+  const presentPct = dashboardSummary?.presentRatePct ?? safePct(presentToday, Math.max(1, activeEmployees));
 
   const lineData = useMemo(
     () => ({
-      labels: weeklyAttendanceData.labels,
+      labels: weeklyAttendance.labels,
       datasets: [
         {
           label: "Check-ins",
-          data: weeklyAttendanceData.values,
+          data: weeklyAttendance.values,
           tension: 0.38,
           borderWidth: 3,
           pointRadius: 2.5,
@@ -342,7 +253,7 @@ export function AdminDashboardPage() {
         },
       ],
     }),
-    [weeklyAttendanceData],
+    [weeklyAttendance],
   );
 
   const chartPalette = useMemo(
@@ -514,7 +425,7 @@ export function AdminDashboardPage() {
               <DashboardChip
                 pulse={tourFocus === "chip"}
                 tooltip="Sort attendance by highest fines"
-                label={`Fines PKR ${monthFineTotal.toFixed(2)}`}
+                label={`Fines PKR ${Number(dashboardSummary?.monthFineTotal ?? 0).toFixed(2)}`}
                 icon={<Wallet className="h-4 w-4" />}
                 className="border-amber-200 bg-amber-50 text-amber-800 dark:border-amber-500/30 dark:bg-amber-950/25 dark:text-amber-200"
                 onClick={() => safeNavigate(routeWithQuery("/admin/all-attendance", { filter: "month", sort: "fine_desc" }))}
@@ -528,7 +439,7 @@ export function AdminDashboardPage() {
         <DashboardStatCard
           pulse={tourFocus === "kpi"}
           title="Total Staff"
-          value={employees.length}
+          value={dashboardSummary?.totalEmployees ?? 0}
           subtitle="All employee records"
           icon={<Users className="h-5 w-5" />}
           cardClass="bg-[linear-gradient(180deg,rgba(239,246,255,0.98),rgba(247,251,255,0.94))] dark:bg-[linear-gradient(180deg,rgba(var(--surface-elevated),1),rgba(var(--surface),1))]"
@@ -539,7 +450,7 @@ export function AdminDashboardPage() {
           pulse={tourFocus === "kpi"}
           title="Present Today"
           value={presentToday}
-          subtitle="Successful check-ins"
+          subtitle="Present + late arrivals"
           icon={<ShieldCheck className="h-5 w-5" />}
           cardClass="bg-[linear-gradient(180deg,rgba(240,253,244,0.98),rgba(247,252,248,0.94))] dark:bg-[linear-gradient(180deg,rgba(var(--surface-elevated),1),rgba(var(--surface),1))]"
           toneClass="border-emerald-300/60 bg-emerald-500/12 text-emerald-700 dark:border-emerald-500/30 dark:text-emerald-200"
@@ -559,7 +470,7 @@ export function AdminDashboardPage() {
           pulse={tourFocus === "kpi"}
           title="Absent"
           value={absentToday}
-          subtitle="Not checked in yet"
+          subtitle="No present/late record today"
           icon={<UserX className="h-5 w-5" />}
           cardClass="bg-[linear-gradient(180deg,rgba(255,241,242,0.98),rgba(255,247,249,0.94))] dark:bg-[linear-gradient(180deg,rgba(var(--surface-elevated),1),rgba(var(--surface),1))]"
           toneClass="border-rose-300/60 bg-rose-500/12 text-rose-700 dark:border-rose-500/30 dark:text-rose-200"
@@ -725,7 +636,7 @@ export function AdminDashboardPage() {
                   >
                     <p className="text-sm font-semibold text-[rgb(var(--text))]">{row.name}</p>
                     <p className="mt-1 text-xs text-[rgb(var(--text-soft))]">
-                      {row.employeeId} • {row.checkInTime || "-"}
+                      {row.employeeId} | {row.checkInTime || "-"}
                     </p>
                   </button>
                 </li>

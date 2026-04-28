@@ -15,7 +15,7 @@ type AttendanceEditModalProps = {
   error: string;
   onClose: () => void;
   onSave: (payload: {
-    status: "Present" | "Late" | "Absent";
+    status: "Present" | "Late" | "Absent" | "Leave";
     checkin_time: string | null;
     source: "face" | "manual";
     note: string;
@@ -23,7 +23,7 @@ type AttendanceEditModalProps = {
 };
 
 type EditFormState = {
-  status: "Present" | "Late" | "Absent";
+  status: "Present" | "Late" | "Absent" | "Leave";
   checkin_time: string;
   source: "face" | "manual";
   note: string;
@@ -34,9 +34,10 @@ function normalizeTimeForInput(value?: string | null) {
   return raw ? raw.slice(0, 5) : "";
 }
 
-function inferStatus(row: AdminAttendanceItem): "Present" | "Late" | "Absent" {
+function inferStatus(row: AdminAttendanceItem): "Present" | "Late" | "Absent" | "Leave" {
   const raw = String(row.status || "").trim().toLowerCase();
   if (raw === "absent") return "Absent";
+  if (raw === "leave") return "Leave";
   return Number(row.late_minutes || 0) > 0 || Number(row.fine_amount || 0) > 0 ? "Late" : "Present";
 }
 
@@ -65,10 +66,13 @@ export function AttendanceEditModal({
     });
   }, [isOpen, row]);
 
-  const checkinDisabled = form.status === "Absent";
+  const checkinDisabled = form.status === "Absent" || form.status === "Leave";
   const recalculationSummary = useMemo(() => {
     if (form.status === "Absent") {
       return "Saving as Absent will clear check-in time and apply the employee's absent fine.";
+    }
+    if (form.status === "Leave") {
+      return "Saving as Leave will clear check-in time, remove fines, and keep the day out of absence totals.";
     }
     if (!form.checkin_time) {
       return "Present or Late requires a check-in time. Late minutes and fine are recalculated on save.";
@@ -79,7 +83,7 @@ export function AttendanceEditModal({
   async function handleSubmit() {
     await onSave({
       status: form.status,
-      checkin_time: form.status === "Absent" ? null : form.checkin_time || null,
+      checkin_time: form.status === "Absent" || form.status === "Leave" ? null : form.checkin_time || null,
       source: form.source,
       note: form.note,
     });
@@ -138,14 +142,15 @@ export function AttendanceEditModal({
               onChange={(event) =>
                 setForm((prev) => ({
                   ...prev,
-                  status: event.target.value as "Present" | "Late" | "Absent",
-                  checkin_time: event.target.value === "Absent" ? "" : prev.checkin_time,
+                  status: event.target.value as "Present" | "Late" | "Absent" | "Leave",
+                  checkin_time: ["Absent", "Leave"].includes(event.target.value) ? "" : prev.checkin_time,
                 }))
               }
             >
               <option value="Present">Present</option>
               <option value="Late">Late</option>
               <option value="Absent">Absent</option>
+              <option value="Leave">Leave</option>
             </Select>
 
             <Input
