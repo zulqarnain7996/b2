@@ -4611,8 +4611,7 @@ def _monthly_report_pdf_bytes(report: dict) -> bytes:
     return buffer.getvalue()
 
 
-@api.get("/admin/reports/monthly-attendance/pdf")
-def admin_monthly_attendance_report_pdf(
+def _admin_monthly_attendance_report_pdf_response(
     employee_id: str,
     month: str,
     current_user: dict = Depends(require_permission("can_view_all_attendance")),
@@ -4627,6 +4626,24 @@ def admin_monthly_attendance_report_pdf(
     filename = f"monthly-attendance-{report['employee']['id']}-{safe_month}.pdf"
     headers = {"Content-Disposition": f'attachment; filename="{filename}"'}
     return StreamingResponse(BytesIO(pdf_bytes), media_type="application/pdf", headers=headers)
+
+
+@api.get("/admin/reports/monthly-attendance/pdf")
+def admin_monthly_attendance_report_pdf(
+    employee_id: str,
+    month: str,
+    current_user: dict = Depends(require_permission("can_view_all_attendance")),
+):
+    return _admin_monthly_attendance_report_pdf_response(employee_id, month, current_user)
+
+
+@api.get("/admin/reports/monthly-attendance-pdf")
+def admin_monthly_attendance_report_pdf_legacy(
+    employee_id: str,
+    month: str,
+    current_user: dict = Depends(require_permission("can_view_all_attendance")),
+):
+    return _admin_monthly_attendance_report_pdf_response(employee_id, month, current_user)
 
 
 @api.get("/attendance/today")

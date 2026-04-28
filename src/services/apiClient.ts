@@ -658,10 +658,24 @@ export const apiClient = {
     ),
 
   getAdminMonthlyAttendancePDF: async (params: { employee_id: string; month: string }) => {
+    const employeeId = String(params.employee_id || "").trim();
+    const month = String(params.month || "").trim();
+    if (!employeeId) {
+      throw new Error("employee_id is required for PDF download.");
+    }
+    if (!/^\d{4}-\d{2}$/.test(month)) {
+      throw new Error("month must be in YYYY-MM format.");
+    }
+
     const headers: Record<string, string> = {};
     if (accessToken) headers.Authorization = `Bearer ${accessToken}`;
+    headers.Accept = "application/pdf";
+    const query = new URLSearchParams({
+      employee_id: employeeId,
+      month,
+    });
     const response = await fetch(
-      `${API_BASE}/admin/reports/monthly-attendance-pdf?employee_id=${encodeURIComponent(params.employee_id)}&month=${encodeURIComponent(params.month)}`,
+      `${API_BASE}/admin/reports/monthly-attendance/pdf?${query.toString()}`,
       {
         method: "GET",
         headers,
@@ -677,6 +691,10 @@ export const apiClient = {
         // ignore
       }
       throw new Error(detail);
+    }
+    const contentType = response.headers.get("content-type") || "";
+    if (!contentType.toLowerCase().includes("application/pdf")) {
+      throw new Error(`Expected PDF response but received ${contentType || "unknown content type"}.`);
     }
     return response.blob();
   },
