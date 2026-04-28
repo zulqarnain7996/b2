@@ -27,15 +27,20 @@ import {
 } from "lucide-react";
 import { useNavigate } from "react-router-dom";
 import { useAuth } from "@/auth/AuthContext";
+import { Alert } from "@/components/ui/Alert";
 import { WelcomeModal } from "@/components/dashboard/WelcomeModal";
 import { useToast } from "@/components/feedback/ToastProvider";
 import { Button } from "@/components/ui/Button";
 import { Card } from "@/components/ui/Card";
+import { EmptyState } from "@/components/ui/EmptyState";
+import { Input } from "@/components/ui/Input";
 import { Modal } from "@/components/ui/Modal";
+import { Select } from "@/components/ui/Select";
+import { Table } from "@/components/ui/Table";
 import { TableSkeleton } from "@/components/ui/TableSkeleton";
 import { useTheme } from "@/theme/ThemeContext";
 import { apiClient } from "@/services/apiClient";
-import type { AdminDashboardSummaryResponse, AuditLog, Notice } from "@/types";
+import type { AdminDashboardSummaryResponse, AdminMonthlyAttendanceReport, AuditLog, Employee, Notice } from "@/types";
 
 ChartJS.register(ArcElement, CategoryScale, LinearScale, PointElement, LineElement, Tooltip, Legend);
 
@@ -60,6 +65,29 @@ function onCardKeyDown(event: React.KeyboardEvent<HTMLElement>, action: () => vo
 function routeWithQuery(path: string, params: Record<string, string>) {
   const qs = new URLSearchParams(params).toString();
   return qs ? `${path}?${qs}` : path;
+}
+
+function currentMonthValue() {
+  const now = new Date();
+  return `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, "0")}`;
+}
+
+function format12HourTime(value?: string | null) {
+  if (!value) return "-";
+  const str = String(value).trim();
+  const parts = str.split(":");
+  if (parts.length < 2) return str;
+  const hh = Number(parts[0]);
+  const mm = Number(parts[1]);
+  if (!Number.isFinite(hh) || !Number.isFinite(mm)) return str;
+  const ampm = hh >= 12 ? "PM" : "AM";
+  const hour12 = hh % 12 === 0 ? 12 : hh % 12;
+  return `${hour12}:${String(mm).padStart(2, "0")} ${ampm}`;
+}
+
+function csvEscape(value: unknown) {
+  const raw = value === null || value === undefined ? "" : String(value);
+  return `"${raw.split('"').join('""')}"`;
 }
 
 function DashboardStatCard(props: {
@@ -180,6 +208,15 @@ export function AdminDashboardPage() {
   const [selectedNotice, setSelectedNotice] = useState<Notice | null>(null);
   const [showWelcome, setShowWelcome] = useState(false);
   const [tourFocus, setTourFocus] = useState<Hotspot>(null);
+  const [reportOpen, setReportOpen] = useState(false);
+  const [reportEmployees, setReportEmployees] = useState<Employee[]>([]);
+  const [reportEmployeesLoading, setReportEmployeesLoading] = useState(false);
+  const [reportEmployeesError, setReportEmployeesError] = useState("");
+  const [reportEmployeeId, setReportEmployeeId] = useState("");
+  const [reportMonth, setReportMonth] = useState(currentMonthValue);
+  const [reportData, setReportData] = useState<AdminMonthlyAttendanceReport | null>(null);
+  const [reportLoading, setReportLoading] = useState(false);
+  const [reportError, setReportError] = useState("");
   const navLockRef = useRef(false);
 
   function safeNavigate(to: string) {
@@ -229,6 +266,34 @@ export function AdminDashboardPage() {
       localStorage.setItem(key, "1");
     }
   }, [user]);
+
+  useEffect(() => {
+    if (!reportOpen) return;
+    let mounted = true;
+    setReportEmployeesLoading(true);
+    setReportEmployeesError("");
+    apiClient.getEmployees()
+      .then((res) => {
+        if (!mounted) return;
+        const employees = res.employees || [];
+        setReportEmployees(employees);
+        if (!reportEmployeeId && employees.length) {
+          setReportEmployeeId(employees[0].id);
+        }
+      })
+      .catch((error) => {
+        if (!mounted) return;
+        const msg = error instanceof Error ? error.message : "Failed to load employees";
+        setReportEmployeesError(msg);
+        toast.error(msg);
+      })
+      .finally(() => {
+        if (mounted) setReportEmployeesLoading(false);
+      });
+    return () => {
+      mounted = false;
+    };
+  }, [reportEmployeeId, reportOpen, toast]);
 
   const activeEmployees = dashboardSummary?.activeEmployees ?? 0;
   const presentToday = dashboardSummary?.presentToday ?? 0;
@@ -352,6 +417,101 @@ export function AdminDashboardPage() {
     setShowWelcome(false);
   }
 
+  async function generateMonthlyReport() {
+    if (!reportEmployeeId) {
+      const msg = "Select an employee first.";
+      setReportError(msg);
+      toast.error(msg);
+      return;
+    }
+    if (!reportMonth) {
+      const msg = "Select a month first.";
+      setReportError(msg);
+      toast.error(msg);
+      return;
+    }
+
+    setReportLoading(true);
+    setReportError("");
+    try {
+      const res = await apiClient.getAdminMonthlyAttendanceReport({
+        employee_id: reportEmployeeId,
+        month: reportMonth,
+      });
+      setReportData(res);
+    } catch (error) {
+      const msg = error instanceof Error ? error.message : "Failed to generate report";
+      setReportError(msg);
+      setReportData(null);
+      toast.error(msg);
+    } finally {
+      setReportLoading(false);
+    }
+  }
+
+  function downloadMonthlyReportCsv() {
+    if (!reportData) return;
+    const lines = [
+      ["Employee Name", reportData.employee.name],
+      ["Employee Email", reportData.employee.email],
+      ["Department", reportData.employee.department],
+      ["Month", reportData.month],
+      [],
+      ["Present Days", reportData.summary.present_days],
+      ["Late Days", reportData.summary.late_days],
+      ["Absent Days", reportData.summary.absent_days],
+      ["Leave Days", reportData.summary.leave_days],
+      ["Total Fine PKR", Number(reportData.summary.total_fine || 0).toFixed(2)],
+      [],
+      ["Date", "Weekday", "Status", "Check-in Time", "Late Minutes", "Fine PKR", "Source", "Note"],
+      ...reportData.days.map((day) => [
+        day.date,
+        day.weekday,
+        day.status,
+        format12HourTime(day.checkin_time),
+        Number(day.late_minutes || 0),
+        Number(day.fine_amount || 0).toFixed(2),
+        day.source || "",
+        day.note || "",
+      ]),
+    ];
+    const csv = lines.map((row) => row.map(csvEscape).join(",")).join("\n");
+    const blob = new Blob([csv], { type: "text/csv;charset=utf-8;" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = `monthly-attendance-${reportData.employee.id}-${reportData.month}.csv`;
+    a.click();
+    URL.revokeObjectURL(url);
+  }
+
+  async function downloadMonthlyReportPdf() {
+    if (!reportEmployeeId) {
+      const msg = "Select an employee first.";
+      setReportError(msg);
+      toast.error(msg);
+      return;
+    }
+    if (!reportMonth) {
+      const msg = "Select a month first.";
+      setReportError(msg);
+      toast.error(msg);
+      return;
+    }
+
+    try {
+      await apiClient.downloadAdminMonthlyAttendanceReportPdf({
+        employee_id: reportEmployeeId,
+        month: reportMonth,
+      });
+      toast.success("PDF downloaded.");
+    } catch (error) {
+      const msg = error instanceof Error ? error.message : "Failed to download PDF";
+      setReportError(msg);
+      toast.error(msg);
+    }
+  }
+
   if (loading) {
     return (
       <div className="theme-surface mx-auto w-full max-w-7xl rounded-3xl border p-5 backdrop-blur">
@@ -387,6 +547,117 @@ export function AdminDashboardPage() {
             </div>
           </div>
         ) : null}
+      </Modal>
+
+      <Modal
+        isOpen={reportOpen}
+        title="Generate Monthly Report"
+        onClose={() => setReportOpen(false)}
+        width="lg"
+        footer={
+          <>
+            <Button variant="secondary" onClick={() => setReportOpen(false)} disabled={reportLoading}>
+              Close
+            </Button>
+            <Button variant="secondary" onClick={() => void downloadMonthlyReportPdf()} disabled={reportLoading || !reportEmployeeId || !reportMonth}>
+              Download PDF
+            </Button>
+            <Button variant="secondary" onClick={downloadMonthlyReportCsv} disabled={!reportData || reportLoading}>
+              Download CSV
+            </Button>
+            <Button onClick={() => void generateMonthlyReport()} disabled={reportLoading || reportEmployeesLoading}>
+              {reportLoading ? "Generating..." : "Generate"}
+            </Button>
+          </>
+        }
+      >
+        <div className="space-y-4">
+          <div className="grid gap-4 md:grid-cols-2">
+            <Select
+              label="Employee"
+              value={reportEmployeeId}
+              onChange={(event) => setReportEmployeeId(event.target.value)}
+              disabled={reportEmployeesLoading}
+            >
+              {!reportEmployees.length ? <option value="">No employees found</option> : null}
+              {reportEmployees.map((employee) => (
+                <option key={employee.id} value={employee.id}>
+                  {employee.name} | {employee.email} | {employee.department}
+                </option>
+              ))}
+            </Select>
+            <Input
+              label="Month"
+              type="month"
+              value={reportMonth}
+              onChange={(event) => setReportMonth(event.target.value)}
+            />
+          </div>
+
+          {reportEmployeesError ? <Alert variant="error">{reportEmployeesError}</Alert> : null}
+          {reportError ? <Alert variant="error">{reportError}</Alert> : null}
+
+          {reportLoading ? (
+            <TableSkeleton rows={4} columns={4} />
+          ) : !reportData ? (
+            <EmptyState
+              title="No report generated"
+              message="Choose an employee and month, then click Generate to preview the monthly attendance report."
+            />
+          ) : (
+            <div className="space-y-4">
+              <div className="grid gap-3 md:grid-cols-3">
+                <div className="rounded-2xl border p-4">
+                  <p className="text-[11px] font-semibold uppercase tracking-[0.14em] text-[rgb(var(--text-soft))]">Employee</p>
+                  <p className="mt-2 text-sm font-semibold text-[rgb(var(--text))]">{reportData.employee.name}</p>
+                  <p className="mt-1 text-xs text-[rgb(var(--text-soft))]">{reportData.employee.email}</p>
+                  <p className="mt-1 text-xs text-[rgb(var(--text-soft))]">{reportData.employee.department}</p>
+                </div>
+                <div className="rounded-2xl border p-4">
+                  <p className="text-[11px] font-semibold uppercase tracking-[0.14em] text-[rgb(var(--text-soft))]">Summary</p>
+                  <p className="mt-2 text-xs text-[rgb(var(--text-soft))]">Present: <span className="font-semibold text-[rgb(var(--text))]">{reportData.summary.present_days}</span></p>
+                  <p className="mt-1 text-xs text-[rgb(var(--text-soft))]">Late: <span className="font-semibold text-[rgb(var(--text))]">{reportData.summary.late_days}</span></p>
+                  <p className="mt-1 text-xs text-[rgb(var(--text-soft))]">Absent: <span className="font-semibold text-[rgb(var(--text))]">{reportData.summary.absent_days}</span></p>
+                  <p className="mt-1 text-xs text-[rgb(var(--text-soft))]">Leave: <span className="font-semibold text-[rgb(var(--text))]">{reportData.summary.leave_days}</span></p>
+                </div>
+                <div className="rounded-2xl border p-4">
+                  <p className="text-[11px] font-semibold uppercase tracking-[0.14em] text-[rgb(var(--text-soft))]">Month Fine</p>
+                  <p className="mt-2 text-2xl font-bold tracking-tight text-[rgb(var(--text))]">PKR {Number(reportData.summary.total_fine || 0).toFixed(2)}</p>
+                  <p className="mt-1 text-xs text-[rgb(var(--text-soft))]">{reportData.month}</p>
+                </div>
+              </div>
+
+              <Table stickyHeader zebra hoverRows>
+                <thead>
+                  <tr>
+                    <th>Date</th>
+                    <th>Weekday</th>
+                    <th>Status</th>
+                    <th>Check-in</th>
+                    <th>Late</th>
+                    <th>Fine (PKR)</th>
+                    <th>Source</th>
+                    <th>Note</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {reportData.days.map((day) => (
+                    <tr key={day.date}>
+                      <td>{day.date}</td>
+                      <td>{day.weekday}</td>
+                      <td>{day.status}</td>
+                      <td>{format12HourTime(day.checkin_time)}</td>
+                      <td>{Number(day.late_minutes || 0)}</td>
+                      <td>{Number(day.fine_amount || 0).toFixed(2)}</td>
+                      <td>{day.source || "-"}</td>
+                      <td>{day.note || "-"}</td>
+                    </tr>
+                  ))}
+                </tbody>
+              </Table>
+            </div>
+          )}
+        </div>
       </Modal>
 
       <motion.div initial={{ opacity: 0, y: 8 }} animate={{ opacity: 1, y: 0 }} transition={{ duration: 0.24 }}>
@@ -429,6 +700,14 @@ export function AdminDashboardPage() {
                 icon={<Wallet className="h-4 w-4" />}
                 className="border-amber-200 bg-amber-50 text-amber-800 dark:border-amber-500/30 dark:bg-amber-950/25 dark:text-amber-200"
                 onClick={() => safeNavigate(routeWithQuery("/admin/all-attendance", { filter: "month", sort: "fine_desc" }))}
+              />
+              <DashboardChip
+                pulse={tourFocus === "chip"}
+                tooltip="Generate a monthly employee attendance report"
+                label="Generate Report"
+                icon={<Bell className="h-4 w-4" />}
+                className="border-sky-200 bg-sky-50 text-sky-800 dark:border-sky-500/30 dark:bg-sky-950/25 dark:text-sky-200"
+                onClick={() => setReportOpen(true)}
               />
             </div>
           </div>

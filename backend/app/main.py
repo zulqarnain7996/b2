@@ -32,6 +32,12 @@ from fastapi.staticfiles import StaticFiles
 import mysql.connector
 from mysql.connector.errors import IntegrityError
 from PIL import Image, UnidentifiedImageError
+from reportlab.lib import colors
+from reportlab.lib.pagesizes import A4
+from reportlab.lib.units import mm
+from reportlab.pdfbase.pdfmetrics import stringWidth
+from reportlab.platypus import SimpleDocTemplate, Spacer, Table, TableStyle, Paragraph
+from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
 from starlette.background import BackgroundTask
 
 from app.auth import (
@@ -4329,6 +4335,298 @@ def admin_employee_attendance_report(
             for r in history_rows
         ],
     }
+
+
+def _build_admin_monthly_attendance_report(
+    employee_id: str,
+    month: str,
+) -> dict:
+    try:
+        month_start = datetime.strptime(month, "%Y-%m").date().replace(day=1)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail="month must be in YYYY-MM format") from exc
+
+    next_month = (month_start.replace(day=28) + timedelta(days=4)).replace(day=1)
+
+    with get_conn_cursor(dictionary=True) as (_, cursor):
+        cursor.execute(
+            """
+            SELECT
+              id, name, email, department, role, shift_start_time, grace_period_mins,
+              late_fine_pkr, absent_fine_pkr, not_marked_fine_pkr, off_days_json, is_active, photo_url, created_at
+            FROM employees
+            WHERE id=%s
+            LIMIT 1
+            """,
+            (employee_id,),
+        )
+        employee = cursor.fetchone()
+        if not employee:
+            raise HTTPException(status_code=404, detail="Employee not found")
+        if scoped_departments and str(employee.get("department") or "").strip() not in scoped_departments:
+            raise HTTPException(status_code=403, detail="You can only view attendance for your own department.")
+
+        cursor.execute(
+            """
+            SELECT date, status, checkin_time, fine_amount, source, evidence_photo_url, note
+            FROM attendance
+            WHERE employee_id=%s AND date >= %s AND date < %s
+            ORDER BY date ASC
+            """,
+            (employee_id, month_start.isoformat(), next_month.isoformat()),
+        )
+        rows = cursor.fetchall() or []
+
+    by_day = {str(r["date"]): r for r in rows}
+    today = date.today()
+    days: list[dict] = []
+    present_days = 0
+    late_days = 0
+    absent_days = 0
+    leave_days = 0
+    total_fine = 0.0
+    cursor_day = month_start
+
+    while cursor_day < next_month:
+        key = cursor_day.isoformat()
+        row = by_day.get(key)
+        if row:
+            normalized_status, late_minutes, fine_amount = _normalize_monthly_row(cursor_day, row, employee)
+            display_status = (
+                "Pre-Join"
+                if normalized_status == "pre_join"
+                else (
+                    "Off"
+                    if normalized_status == "off"
+                    else (
+                        "Leave"
+                        if normalized_status == "leave"
+                        else ("Late" if late_minutes > 0 else ("Present" if normalized_status == "present" else "Absent"))
+                    )
+                )
+            )
+            note = row.get("note")
+            source = row.get("source")
+            evidence_photo_url = row.get("evidence_photo_url")
+            checkin_time = row.get("checkin_time")
+        else:
+            derived_status, fine_amount = _derive_missing_day(cursor_day, today, employee)
+            display_status = (
+                "Pre-Join"
+                if derived_status == "pre_join"
+                else ("Off" if derived_status == "off" else ("Absent" if derived_status == "absent" else "Not Marked"))
+            )
+            late_minutes = 0
+            note = None
+            source = None
+            evidence_photo_url = None
+            checkin_time = None
+
+        if display_status == "Present":
+            present_days += 1
+        elif display_status == "Late":
+            present_days += 1
+            late_days += 1
+        elif display_status == "Absent":
+            absent_days += 1
+        elif display_status == "Leave":
+            leave_days += 1
+
+        total_fine += float(fine_amount or 0)
+        days.append(
+            {
+                "date": key,
+                "weekday": cursor_day.strftime("%a"),
+                "status": display_status,
+                "checkin_time": checkin_time,
+                "late_minutes": int(late_minutes or 0),
+                "fine_amount": float(fine_amount or 0),
+                "source": source,
+                "evidence_photo_url": evidence_photo_url,
+                "note": note,
+            }
+        )
+        cursor_day += timedelta(days=1)
+
+    return {
+        "ok": True,
+        "month": month,
+        "employee": {
+            "id": str(employee["id"]),
+            "name": employee["name"],
+            "email": employee["email"],
+            "department": employee["department"],
+            "role": employee["role"],
+            "is_active": bool(employee["is_active"]),
+            "photo_url": employee.get("photo_url"),
+        },
+        "summary": {
+            "present_days": present_days,
+            "late_days": late_days,
+            "absent_days": absent_days,
+            "leave_days": leave_days,
+            "total_fine": round(total_fine, 2),
+        },
+        "days": days,
+    }
+
+
+@api.get("/admin/reports/monthly-attendance")
+def admin_monthly_attendance_report(
+    employee_id: str,
+    month: str,
+    current_user: dict = Depends(require_permission("can_view_all_attendance")),
+):
+    scoped_departments = _resolve_department_scope_for_user(current_user, permission_key="can_view_all_attendance")
+    report = _build_admin_monthly_attendance_report(employee_id, month)
+    if scoped_departments and str(report["employee"].get("department") or "").strip() not in scoped_departments:
+        raise HTTPException(status_code=403, detail="You can only view attendance for your own department.")
+    return report
+
+
+def _monthly_report_pdf_bytes(report: dict) -> bytes:
+    buffer = BytesIO()
+    doc = SimpleDocTemplate(
+        buffer,
+        pagesize=A4,
+        leftMargin=14 * mm,
+        rightMargin=14 * mm,
+        topMargin=14 * mm,
+        bottomMargin=14 * mm,
+    )
+    styles = getSampleStyleSheet()
+    title_style = styles["Title"]
+    title_style.textColor = colors.HexColor("#0f172a")
+    meta_style = styles["BodyText"]
+    meta_style.fontSize = 10
+    meta_style.leading = 14
+    small_style = ParagraphStyle(
+        "SmallCell",
+        parent=styles["BodyText"],
+        fontSize=8.5,
+        leading=11,
+        textColor=colors.HexColor("#0f172a"),
+    )
+    footer_style = ParagraphStyle(
+        "Footer",
+        parent=styles["BodyText"],
+        fontSize=8,
+        leading=10,
+        textColor=colors.HexColor("#64748b"),
+    )
+
+    employee = report["employee"]
+    summary = report["summary"]
+    days = report["days"]
+    generated_at = datetime.now().strftime("%Y-%m-%d %H:%M")
+
+    elements: list[object] = [
+        Paragraph("Monthly Attendance Report", title_style),
+        Spacer(1, 4 * mm),
+        Paragraph(f"<b>Employee:</b> {employee['name']}", meta_style),
+        Paragraph(f"<b>Email:</b> {employee['email']}", meta_style),
+        Paragraph(f"<b>Department:</b> {employee['department']}", meta_style),
+        Paragraph(f"<b>Month:</b> {report['month']}", meta_style),
+        Spacer(1, 5 * mm),
+    ]
+
+    summary_table = Table(
+        [
+            ["Present", "Late", "Absent", "Leave", "Total Fine (PKR)"],
+            [
+                str(summary["present_days"]),
+                str(summary["late_days"]),
+                str(summary["absent_days"]),
+                str(summary["leave_days"]),
+                f"{float(summary['total_fine']):.2f}",
+            ],
+        ],
+        colWidths=[34 * mm, 30 * mm, 30 * mm, 30 * mm, 46 * mm],
+    )
+    summary_table.setStyle(
+        TableStyle(
+            [
+                ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#e2e8f0")),
+                ("TEXTCOLOR", (0, 0), (-1, 0), colors.HexColor("#0f172a")),
+                ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
+                ("FONTNAME", (0, 1), (-1, 1), "Helvetica"),
+                ("FONTSIZE", (0, 0), (-1, -1), 9),
+                ("ALIGN", (0, 0), (-1, -1), "CENTER"),
+                ("GRID", (0, 0), (-1, -1), 0.5, colors.HexColor("#cbd5e1")),
+                ("BOTTOMPADDING", (0, 0), (-1, -1), 6),
+                ("TOPPADDING", (0, 0), (-1, -1), 6),
+            ]
+        )
+    )
+    elements.extend([summary_table, Spacer(1, 6 * mm)])
+
+    day_rows: list[list[object]] = [[
+        Paragraph("<b>Date</b>", small_style),
+        Paragraph("<b>Day</b>", small_style),
+        Paragraph("<b>Status</b>", small_style),
+        Paragraph("<b>Check-in</b>", small_style),
+        Paragraph("<b>Late</b>", small_style),
+        Paragraph("<b>Fine</b>", small_style),
+        Paragraph("<b>Source</b>", small_style),
+        Paragraph("<b>Note</b>", small_style),
+    ]]
+
+    for day in days:
+        day_rows.append(
+            [
+                Paragraph(str(day["date"]), small_style),
+                Paragraph(str(day["weekday"]), small_style),
+                Paragraph(str(day["status"]), small_style),
+                Paragraph(str(day.get("checkin_time") or "-"), small_style),
+                Paragraph(str(int(day.get("late_minutes") or 0)), small_style),
+                Paragraph(f"{float(day.get('fine_amount') or 0):.2f}", small_style),
+                Paragraph(str(day.get("source") or "-"), small_style),
+                Paragraph(str(day.get("note") or "-"), small_style),
+            ]
+        )
+
+    detail_table = Table(
+        day_rows,
+        repeatRows=1,
+        colWidths=[24 * mm, 18 * mm, 23 * mm, 22 * mm, 14 * mm, 18 * mm, 17 * mm, 44 * mm],
+    )
+    detail_table.setStyle(
+        TableStyle(
+            [
+                ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#0f172a")),
+                ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
+                ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
+                ("GRID", (0, 0), (-1, -1), 0.35, colors.HexColor("#cbd5e1")),
+                ("VALIGN", (0, 0), (-1, -1), "TOP"),
+                ("FONTSIZE", (0, 0), (-1, -1), 8),
+                ("ROWBACKGROUNDS", (0, 1), (-1, -1), [colors.white, colors.HexColor("#f8fafc")]),
+                ("TOPPADDING", (0, 0), (-1, -1), 4),
+                ("BOTTOMPADDING", (0, 0), (-1, -1), 4),
+            ]
+        )
+    )
+    elements.extend([detail_table, Spacer(1, 5 * mm), Paragraph(f"Generated on {generated_at}", footer_style)])
+
+    doc.build(elements)
+    return buffer.getvalue()
+
+
+@api.get("/admin/reports/monthly-attendance/pdf")
+def admin_monthly_attendance_report_pdf(
+    employee_id: str,
+    month: str,
+    current_user: dict = Depends(require_permission("can_view_all_attendance")),
+):
+    scoped_departments = _resolve_department_scope_for_user(current_user, permission_key="can_view_all_attendance")
+    report = _build_admin_monthly_attendance_report(employee_id, month)
+    if scoped_departments and str(report["employee"].get("department") or "").strip() not in scoped_departments:
+        raise HTTPException(status_code=403, detail="You can only view attendance for your own department.")
+
+    pdf_bytes = _monthly_report_pdf_bytes(report)
+    safe_month = str(month).replace("/", "-")
+    filename = f"monthly-attendance-{report['employee']['id']}-{safe_month}.pdf"
+    headers = {"Content-Disposition": f'attachment; filename="{filename}"'}
+    return StreamingResponse(BytesIO(pdf_bytes), media_type="application/pdf", headers=headers)
 
 
 @api.get("/attendance/today")

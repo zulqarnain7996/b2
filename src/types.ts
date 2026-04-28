@@ -271,6 +271,38 @@ export type AdminAttendanceEmployeeReport = {
   }>;
 };
 
+export type AdminMonthlyAttendanceReport = {
+  ok: boolean;
+  month: string;
+  employee: {
+    id: string;
+    name: string;
+    email: string;
+    department: string;
+    role: string;
+    is_active: boolean;
+    photo_url?: string | null;
+  };
+  summary: {
+    present_days: number;
+    late_days: number;
+    absent_days: number;
+    leave_days: number;
+    total_fine: number;
+  };
+  days: Array<{
+    date: string;
+    weekday: string;
+    status: "Present" | "Late" | "Absent" | "Leave" | "Not Marked" | "Off" | "Pre-Join";
+    checkin_time: string | null;
+    late_minutes: number;
+    fine_amount: number;
+    source: "face" | "manual" | null;
+    evidence_photo_url: string | null;
+    note: string | null;
+  }>;
+};
+
 export type AppSettings = {
   shift_start_time: string;
   grace_period_mins: number;

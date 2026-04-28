@@ -4,6 +4,7 @@ import type {
   AdminDashboardSummaryResponse,
   AdminAttendanceEmployeeReport,
   AdminEmployeeDetail,
+  AdminMonthlyAttendanceReport,
   AdminAttendanceItem,
   AdminNotice,
   AppSettings,
@@ -650,6 +651,47 @@ export const apiClient = {
 
   getAdminAttendanceEmployeeReport: (employeeId: string) =>
     request<AdminAttendanceEmployeeReport>(`/admin/attendance/employee/${encodeURIComponent(employeeId)}`),
+
+  getAdminMonthlyAttendanceReport: (params: { employee_id: string; month: string }) =>
+    request<AdminMonthlyAttendanceReport>(
+      `/admin/reports/monthly-attendance?employee_id=${encodeURIComponent(params.employee_id)}&month=${encodeURIComponent(params.month)}`,
+    ),
+
+  downloadAdminMonthlyAttendanceReportPdf: async (params: { employee_id: string; month: string }) => {
+    const headers: Record<string, string> = {};
+    if (accessToken) headers.Authorization = `Bearer ${accessToken}`;
+    const response = await fetch(
+      `${API_BASE}/admin/reports/monthly-attendance/pdf?employee_id=${encodeURIComponent(params.employee_id)}&month=${encodeURIComponent(params.month)}`,
+      {
+        method: "GET",
+        headers,
+        credentials: "include",
+      },
+    );
+    if (!response.ok) {
+      const raw = await response.text();
+      let detail = "PDF download failed";
+      try {
+        detail = JSON.parse(raw)?.detail || detail;
+      } catch {
+        // ignore
+      }
+      throw new Error(detail);
+    }
+    const blob = await response.blob();
+    const cd = response.headers.get("content-disposition") || "";
+    const match = cd.match(/filename=\"?([^"]+)\"?/i);
+    const filename = match?.[1] || `monthly-attendance-${params.employee_id}-${params.month}.pdf`;
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = filename;
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    URL.revokeObjectURL(url);
+    return { ok: true, filename };
+  },
 
   updateAdminAttendance: (
     id: string,
