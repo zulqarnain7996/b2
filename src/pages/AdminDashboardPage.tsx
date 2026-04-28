@@ -90,6 +90,13 @@ function csvEscape(value: unknown) {
   return `"${raw.split('"').join('""')}"`;
 }
 
+function sanitizeFilenamePart(value: string) {
+  return value
+    .trim()
+    .replace(/\s+/g, "_")
+    .replace(/[^a-zA-Z0-9._-]/g, "");
+}
+
 function DashboardStatCard(props: {
   title: string;
   value: number | string;
@@ -500,10 +507,20 @@ export function AdminDashboardPage() {
     }
 
     try {
-      await apiClient.downloadAdminMonthlyAttendanceReportPdf({
+      const blob = await apiClient.getAdminMonthlyAttendancePDF({
         employee_id: reportEmployeeId,
         month: reportMonth,
       });
+      const employeeName = reportData?.employee.name || reportEmployees.find((employee) => employee.id === reportEmployeeId)?.name || reportEmployeeId;
+      const filename = `monthly_attendance_${sanitizeFilenamePart(employeeName)}_${reportMonth}.pdf`;
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement("a");
+      a.href = url;
+      a.download = filename;
+      document.body.appendChild(a);
+      a.click();
+      document.body.removeChild(a);
+      URL.revokeObjectURL(url);
       toast.success("PDF downloaded.");
     } catch (error) {
       const msg = error instanceof Error ? error.message : "Failed to download PDF";

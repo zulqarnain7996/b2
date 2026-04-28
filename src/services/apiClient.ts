@@ -657,11 +657,11 @@ export const apiClient = {
       `/admin/reports/monthly-attendance?employee_id=${encodeURIComponent(params.employee_id)}&month=${encodeURIComponent(params.month)}`,
     ),
 
-  downloadAdminMonthlyAttendanceReportPdf: async (params: { employee_id: string; month: string }) => {
+  getAdminMonthlyAttendancePDF: async (params: { employee_id: string; month: string }) => {
     const headers: Record<string, string> = {};
     if (accessToken) headers.Authorization = `Bearer ${accessToken}`;
     const response = await fetch(
-      `${API_BASE}/admin/reports/monthly-attendance/pdf?employee_id=${encodeURIComponent(params.employee_id)}&month=${encodeURIComponent(params.month)}`,
+      `${API_BASE}/admin/reports/monthly-attendance-pdf?employee_id=${encodeURIComponent(params.employee_id)}&month=${encodeURIComponent(params.month)}`,
       {
         method: "GET",
         headers,
@@ -678,20 +678,11 @@ export const apiClient = {
       }
       throw new Error(detail);
     }
-    const blob = await response.blob();
-    const cd = response.headers.get("content-disposition") || "";
-    const match = cd.match(/filename=\"?([^"]+)\"?/i);
-    const filename = match?.[1] || `monthly-attendance-${params.employee_id}-${params.month}.pdf`;
-    const url = URL.createObjectURL(blob);
-    const a = document.createElement("a");
-    a.href = url;
-    a.download = filename;
-    document.body.appendChild(a);
-    a.click();
-    document.body.removeChild(a);
-    URL.revokeObjectURL(url);
-    return { ok: true, filename };
+    return response.blob();
   },
+
+  downloadAdminMonthlyAttendanceReportPdf: (params: { employee_id: string; month: string }) =>
+    apiClient.getAdminMonthlyAttendancePDF(params),
 
   updateAdminAttendance: (
     id: string,

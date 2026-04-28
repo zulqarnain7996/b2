@@ -7,6 +7,7 @@ import {
   ChevronRight,
   CircleAlert,
   Clock3,
+  Download,
   Search,
   Wallet,
   X,
@@ -41,6 +42,17 @@ const WEEKDAYS = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
 
 function toMonthLabel(d: Date): string {
   return d.toLocaleDateString(undefined, { month: "long", year: "numeric" });
+}
+
+function toMonthValue(d: Date): string {
+  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}`;
+}
+
+function sanitizeFilenamePart(value: string): string {
+  return value
+    .trim()
+    .replace(/\s+/g, "_")
+    .replace(/[^a-zA-Z0-9._-]/g, "");
 }
 
 function formatTime(value: string | null): string {
@@ -157,6 +169,7 @@ export function MonthlyAttendancePage() {
   const [actionNote, setActionNote] = useState("");
   const [actionError, setActionError] = useState("");
   const [actionSaving, setActionSaving] = useState(false);
+  const [pdfDownloading, setPdfDownloading] = useState(false);
 
   const todayIso = useMemo(() => localYmd(now), [now]);
   const employeeOptions = useMemo(() => {
@@ -421,10 +434,57 @@ export function MonthlyAttendancePage() {
     setCurrentMonth(startOfMonthLocal(now.getFullYear(), now.getMonth()));
   }
 
+  function onMonthInputChange(value: string) {
+    const match = value.match(/^(\d{4})-(\d{2})$/);
+    if (!match) return;
+    const year = Number(match[1]);
+    const monthIndex = Number(match[2]) - 1;
+    if (!Number.isFinite(year) || !Number.isFinite(monthIndex) || monthIndex < 0 || monthIndex > 11) return;
+    setCurrentMonth(startOfMonthLocal(year, monthIndex));
+  }
+
   function clearAdminFilters() {
     setDepartmentFilter("all");
     setRoleFilter("all");
     setSearchQuery("");
+  }
+
+  async function downloadMonthlyPDF() {
+    if (!isAdmin) {
+      toast.error("Only admins can download this PDF report.");
+      return;
+    }
+    if (!selectedEmployeeId || !selectedEmployee) {
+      const msg = "Select an employee before downloading the PDF.";
+      setError(msg);
+      toast.error(msg);
+      return;
+    }
+
+    setPdfDownloading(true);
+    try {
+      const month = toMonthValue(currentMonth);
+      const blob = await apiClient.getAdminMonthlyAttendancePDF({
+        employee_id: selectedEmployeeId,
+        month,
+      });
+      const filename = `monthly_attendance_${sanitizeFilenamePart(selectedEmployee.name) || selectedEmployee.id}_${month}.pdf`;
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement("a");
+      a.href = url;
+      a.download = filename;
+      document.body.appendChild(a);
+      a.click();
+      document.body.removeChild(a);
+      URL.revokeObjectURL(url);
+      toast.success("Monthly attendance PDF downloaded.");
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : "Failed to download monthly attendance PDF.";
+      setError(msg);
+      toast.error(msg);
+    } finally {
+      setPdfDownloading(false);
+    }
   }
 
   function stopCameraStream() {
@@ -758,6 +818,13 @@ export function MonthlyAttendancePage() {
             ) : null}
 
             <div className="flex flex-wrap items-center gap-2">
+              <Input
+                label="Month"
+                type="month"
+                value={toMonthValue(currentMonth)}
+                onChange={(event) => onMonthInputChange(event.target.value)}
+                className="min-w-[180px]"
+              />
               <Button variant="secondary" onClick={goPrevMonth}>
                 <ChevronLeft className="h-4 w-4" />
                 Prev
@@ -768,6 +835,16 @@ export function MonthlyAttendancePage() {
                 <ChevronRight className="h-4 w-4" />
               </Button>
               {!isViewingCurrentMonth ? <Button variant="secondary" onClick={jumpToCurrentMonth}>Today</Button> : null}
+              {isAdmin ? (
+                <Button
+                  variant="secondary"
+                  onClick={() => void downloadMonthlyPDF()}
+                  disabled={pdfDownloading || employeesLoading || !selectedEmployeeId}
+                >
+                  <Download className="h-4 w-4" />
+                  {pdfDownloading ? "Downloading..." : "Download PDF"}
+                </Button>
+              ) : null}
             </div>
           </div>
         </div>
