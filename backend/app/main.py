@@ -4340,6 +4340,7 @@ def admin_employee_attendance_report(
 def _build_admin_monthly_attendance_report(
     employee_id: str,
     month: str,
+    scoped_departments: list[str] | None = None,
 ) -> dict:
     try:
         month_start = datetime.strptime(month, "%Y-%m").date().replace(day=1)
@@ -4478,9 +4479,7 @@ def admin_monthly_attendance_report(
     current_user: dict = Depends(require_permission("can_view_all_attendance")),
 ):
     scoped_departments = _resolve_department_scope_for_user(current_user, permission_key="can_view_all_attendance")
-    report = _build_admin_monthly_attendance_report(employee_id, month)
-    if scoped_departments and str(report["employee"].get("department") or "").strip() not in scoped_departments:
-        raise HTTPException(status_code=403, detail="You can only view attendance for your own department.")
+    report = _build_admin_monthly_attendance_report(employee_id, month, scoped_departments)
     return report
 
 
@@ -4617,9 +4616,7 @@ def _admin_monthly_attendance_report_pdf_response(
     current_user: dict = Depends(require_permission("can_view_all_attendance")),
 ):
     scoped_departments = _resolve_department_scope_for_user(current_user, permission_key="can_view_all_attendance")
-    report = _build_admin_monthly_attendance_report(employee_id, month)
-    if scoped_departments and str(report["employee"].get("department") or "").strip() not in scoped_departments:
-        raise HTTPException(status_code=403, detail="You can only view attendance for your own department.")
+    report = _build_admin_monthly_attendance_report(employee_id, month, scoped_departments)
 
     pdf_bytes = _monthly_report_pdf_bytes(report)
     safe_month = str(month).replace("/", "-")
