@@ -1,6 +1,6 @@
 import { createContext, useContext, useEffect, useMemo, useState } from "react";
 import type { ReactNode } from "react";
-import { apiClient, setAccessToken } from "../services/apiClient";
+import { apiClient, getStoredAccessToken, persistAccessToken, setAccessToken } from "../services/apiClient";
 import type { AuthUser, PermissionKey } from "../types";
 
 type AuthContextValue = {
@@ -28,16 +28,22 @@ export function AuthProvider({ children }: { children: ReactNode }) {
   const [loading, setLoading] = useState(true);
 
   useEffect(() => {
+    const storedToken = getStoredAccessToken();
+    setAccessToken(storedToken);
+    if (storedToken) {
+      setToken(storedToken);
+    }
     apiClient
       .getMe()
       .then((res) => {
         setUser(res.user);
-        setToken("cookie-session");
+        setToken(storedToken || "cookie-session");
         setLoginEventKey(null);
         setRefreshEventKey(`refresh:${Date.now()}:${res.user.id}`);
       })
       .catch(() => {
         setAccessToken(null);
+        persistAccessToken(null);
         setToken(null);
         setLoginEventKey(null);
         setRefreshEventKey(null);
@@ -64,8 +70,10 @@ export function AuthProvider({ children }: { children: ReactNode }) {
 
   async function login(email: string, password: string) {
     const res = await apiClient.login({ email, password });
-    setAccessToken(null);
-    setToken("cookie-session");
+    const nextToken = String(res.token || "").trim() || null;
+    setAccessToken(nextToken);
+    persistAccessToken(nextToken);
+    setToken(nextToken || "cookie-session");
     setLoginEventKey(`login:${Date.now()}:${res.user.id}`);
     setRefreshEventKey(null);
     try {
@@ -79,6 +87,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
   function logout() {
     void apiClient.logout().catch(() => undefined).finally(() => {
       setAccessToken(null);
+      persistAccessToken(null);
       setToken(null);
       setLoginEventKey(null);
       setRefreshEventKey(null);
@@ -90,7 +99,9 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     if (!token && !user) return;
     const res = await apiClient.getMe();
     setUser(res.user);
-    setToken("cookie-session");
+    const storedToken = getStoredAccessToken();
+    setAccessToken(storedToken);
+    setToken(storedToken || "cookie-session");
   }
 
   const value = useMemo<AuthContextValue>(

@@ -103,6 +103,7 @@ function resolveApiBase(): string {
 
 const API_BASE = resolveApiBase();
 const SERVER_ORIGIN = /^https?:\/\//i.test(API_BASE) ? API_BASE.replace(/\/api\/?$/, "") : "";
+const AUTH_TOKEN_STORAGE_KEY = "ivs_access_token";
 let accessToken: string | null = null;
 
 function normalizeOffDaysPayload(payload: {
@@ -129,6 +130,22 @@ function normalizeOffDaysPayload(payload: {
 
 export function setAccessToken(token: string | null) {
   accessToken = token;
+}
+
+export function getStoredAccessToken(): string | null {
+  if (typeof window === "undefined") return null;
+  const raw = window.localStorage.getItem(AUTH_TOKEN_STORAGE_KEY);
+  const token = String(raw || "").trim();
+  return token || null;
+}
+
+export function persistAccessToken(token: string | null) {
+  if (typeof window === "undefined") return;
+  if (token) {
+    window.localStorage.setItem(AUTH_TOKEN_STORAGE_KEY, token);
+  } else {
+    window.localStorage.removeItem(AUTH_TOKEN_STORAGE_KEY);
+  }
 }
 
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
@@ -166,6 +183,7 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
     }
     if (response.status === 401 && path === "/auth/me") {
       setAccessToken(null);
+      persistAccessToken(null);
       if (typeof window !== "undefined" && window.location.pathname !== "/login") {
         window.location.assign("/login");
       }
