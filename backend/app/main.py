@@ -20,6 +20,7 @@ from contextlib import contextmanager
 from datetime import date, datetime, timedelta, time
 from io import BytesIO
 from pathlib import Path
+from xml.sax.saxutils import escape
 
 import numpy as np
 from dotenv import load_dotenv
@@ -33,7 +34,7 @@ import mysql.connector
 from mysql.connector.errors import IntegrityError
 from PIL import Image, UnidentifiedImageError
 from reportlab.lib import colors
-from reportlab.lib.pagesizes import A4, landscape
+from reportlab.lib.pagesizes import A4
 from reportlab.lib.units import mm
 from reportlab.pdfbase.pdfmetrics import stringWidth
 from reportlab.platypus import SimpleDocTemplate, Spacer, Table, TableStyle, Paragraph, Image as PlatypusImage
@@ -4509,124 +4510,238 @@ def _resolve_upload_path(file_url: str | None) -> Path | None:
     return candidate
 
 
-def _pdf_image_or_placeholder(file_url: str | None, width_mm: float, height_mm: float, text_style: ParagraphStyle):
+def _pdf_text(value: object, fallback: str = "-") -> str:
+    text = str(value if value not in (None, "") else fallback).strip()
+    return escape(text or fallback)
+
+
+def _pdf_image_or_placeholder(
+    file_url: str | None,
+    width_mm: float,
+    height_mm: float,
+    text_style: ParagraphStyle,
+    placeholder: str = "No photo",
+):
+    def placeholder_box(message: str) -> Table:
+        box = Table(
+            [[Paragraph(f"<font color='#64748b'>{escape(message)}</font>", text_style)]],
+            colWidths=[width_mm * mm],
+            rowHeights=[height_mm * mm],
+        )
+        box.setStyle(
+            TableStyle(
+                [
+                    ("BACKGROUND", (0, 0), (-1, -1), colors.HexColor("#f8fafc")),
+                    ("BOX", (0, 0), (-1, -1), 0.45, colors.HexColor("#cbd5e1")),
+                    ("ALIGN", (0, 0), (-1, -1), "CENTER"),
+                    ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+                    ("LEFTPADDING", (0, 0), (-1, -1), 2),
+                    ("RIGHTPADDING", (0, 0), (-1, -1), 2),
+                    ("TOPPADDING", (0, 0), (-1, -1), 2),
+                    ("BOTTOMPADDING", (0, 0), (-1, -1), 2),
+                ]
+            )
+        )
+        return box
+
     path = _resolve_upload_path(file_url)
     if not path:
-        return Paragraph("<font color='#94a3b8'>No photo</font>", text_style)
+        return placeholder_box(placeholder)
     try:
         image = Image.open(path)
         image.load()
         image.thumbnail((int(width_mm * 8), int(height_mm * 8)))
+        image_width, image_height = image.size
         buffer = BytesIO()
         image.convert("RGB").save(buffer, format="JPEG", quality=88)
         buffer.seek(0)
-        pdf_image = PlatypusImage(buffer, width=width_mm * mm, height=height_mm * mm)
+        scale = min((width_mm * mm) / image_width, (height_mm * mm) / image_height)
+        pdf_image = PlatypusImage(buffer)
+        pdf_image.drawWidth = image_width * scale
+        pdf_image.drawHeight = image_height * scale
         pdf_image.hAlign = "CENTER"
         return pdf_image
     except Exception:
-        return Paragraph("<font color='#94a3b8'>Photo unavailable</font>", text_style)
+        return placeholder_box("Photo unavailable")
 
 
 def _monthly_report_pdf_bytes(report: dict) -> bytes:
     buffer = BytesIO()
     doc = SimpleDocTemplate(
         buffer,
-        pagesize=landscape(A4),
-        leftMargin=10 * mm,
-        rightMargin=10 * mm,
-        topMargin=10 * mm,
-        bottomMargin=10 * mm,
+        pagesize=A4,
+        leftMargin=12 * mm,
+        rightMargin=12 * mm,
+        topMargin=11 * mm,
+        bottomMargin=11 * mm,
     )
     styles = getSampleStyleSheet()
     title_style = ParagraphStyle(
         "MonthlyTitle",
         parent=styles["Title"],
-        fontSize=22,
-        leading=26,
+        fontSize=20,
+        leading=24,
         textColor=colors.HexColor("#0f172a"),
+        alignment=0,
+        spaceAfter=2,
     )
     section_label_style = ParagraphStyle(
         "SectionLabel",
         parent=styles["BodyText"],
-        fontSize=8,
-        leading=10,
+        fontSize=7.5,
+        leading=9,
         textColor=colors.HexColor("#64748b"),
     )
     meta_style = ParagraphStyle(
         "MetaText",
         parent=styles["BodyText"],
-        fontSize=10,
-        leading=13,
+        fontSize=8.5,
+        leading=11,
         textColor=colors.HexColor("#0f172a"),
     )
     small_style = ParagraphStyle(
         "SmallCell",
         parent=styles["BodyText"],
-        fontSize=8.5,
-        leading=11,
+        fontSize=8,
+        leading=10,
         textColor=colors.HexColor("#0f172a"),
     )
     compact_style = ParagraphStyle(
         "CompactCell",
         parent=small_style,
-        fontSize=7.5,
+        fontSize=7,
+        leading=8.5,
+    )
+    header_cell_style = ParagraphStyle(
+        "AttendanceHeaderCell",
+        parent=compact_style,
+        fontSize=7.2,
         leading=9,
+        textColor=colors.white,
+        alignment=1,
+    )
+    muted_center_style = ParagraphStyle(
+        "MutedCenter",
+        parent=compact_style,
+        fontSize=6.5,
+        leading=7.5,
+        textColor=colors.HexColor("#64748b"),
+        alignment=1,
     )
     summary_label_style = ParagraphStyle(
         "SummaryLabel",
         parent=styles["BodyText"],
-        fontSize=8,
-        leading=10,
+        fontSize=7.3,
+        leading=9,
         textColor=colors.HexColor("#475569"),
         alignment=1,
     )
     summary_value_style = ParagraphStyle(
         "SummaryValue",
         parent=styles["BodyText"],
-        fontSize=14,
-        leading=18,
+        fontSize=12,
+        leading=15,
         textColor=colors.HexColor("#0f172a"),
         alignment=1,
     )
     footer_style = ParagraphStyle(
         "Footer",
         parent=styles["BodyText"],
-        fontSize=8,
-        leading=10,
+        fontSize=7,
+        leading=9,
         textColor=colors.HexColor("#64748b"),
+    )
+    status_text_style = ParagraphStyle(
+        "StatusText",
+        parent=compact_style,
+        fontSize=7.2,
+        leading=8.5,
+        alignment=1,
+        textColor=colors.white,
     )
 
     employee = report["employee"]
     summary = report["summary"]
     days = report["days"]
     generated_at = datetime.now().strftime("%Y-%m-%d %H:%M")
-    employee_photo = _pdf_image_or_placeholder(employee.get("photo_url"), 28, 28, compact_style)
+    employee_photo = _pdf_image_or_placeholder(employee.get("photo_url"), 24, 24, muted_center_style, "No photo")
+
+    def month_label(month_value: object) -> str:
+        try:
+            return datetime.strptime(str(month_value), "%Y-%m").strftime("%B %Y")
+        except ValueError:
+            return str(month_value or "-")
+
+    def day_label(date_value: object, weekday_value: object) -> str:
+        try:
+            parsed = datetime.strptime(str(date_value), "%Y-%m-%d")
+            return f"{parsed.day} {parsed.strftime('%b')} {weekday_value or parsed.strftime('%a')}"
+        except ValueError:
+            return f"{date_value or '-'} {weekday_value or ''}".strip()
+
+    def status_palette(status: object) -> tuple[colors.Color, colors.Color]:
+        normalized = str(status or "").strip().lower()
+        if normalized == "late":
+            return colors.HexColor("#d97706"), colors.HexColor("#fffbeb")
+        if normalized == "present":
+            return colors.HexColor("#15803d"), colors.HexColor("#f0fdf4")
+        if normalized == "absent":
+            return colors.HexColor("#dc2626"), colors.HexColor("#fef2f2")
+        if normalized == "leave":
+            return colors.HexColor("#2563eb"), colors.HexColor("#eff6ff")
+        if normalized == "off":
+            return colors.HexColor("#64748b"), colors.HexColor("#f8fafc")
+        return colors.HexColor("#7c3aed"), colors.HexColor("#f5f3ff")
+
+    def status_badge(status: object) -> Table:
+        badge_color, _ = status_palette(status)
+        badge = Table(
+            [[Paragraph(f"<b>{_pdf_text(status)}</b>", status_text_style)]],
+            colWidths=[20 * mm],
+            rowHeights=[5.2 * mm],
+        )
+        badge.setStyle(
+            TableStyle(
+                [
+                    ("BACKGROUND", (0, 0), (-1, -1), badge_color),
+                    ("BOX", (0, 0), (-1, -1), 0.25, badge_color),
+                    ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+                    ("LEFTPADDING", (0, 0), (-1, -1), 2),
+                    ("RIGHTPADDING", (0, 0), (-1, -1), 2),
+                    ("TOPPADDING", (0, 0), (-1, -1), 1),
+                    ("BOTTOMPADDING", (0, 0), (-1, -1), 1),
+                ]
+            )
+        )
+        return badge
 
     title_block = [
         Paragraph("Monthly Attendance Report", title_style),
-        Paragraph("Employee information, monthly summary, and day-wise attendance evidence.", meta_style),
+        Paragraph(f"Month: <b>{_pdf_text(month_label(report.get('month')))}</b>", meta_style),
+        Paragraph(f"Generated: {_pdf_text(generated_at)}", footer_style),
     ]
     employee_info_table = Table(
         [
             [
                 employee_photo,
                 [
-                    Paragraph("EMPLOYEE INFORMATION", section_label_style),
-                    Paragraph(f"<b>Name:</b> {employee['name']}", meta_style),
-                    Paragraph(f"<b>Email:</b> {employee['email']}", meta_style),
-                    Paragraph(f"<b>Department:</b> {employee['department']}", meta_style),
-                    Paragraph(f"<b>Role:</b> {employee.get('role') or '-'}", meta_style),
-                    Paragraph(f"<b>Month:</b> {report['month']}", meta_style),
+                    Paragraph("<b>EMPLOYEE INFORMATION</b>", section_label_style),
+                    Paragraph(f"<b>Name:</b> {_pdf_text(employee.get('name'))}", meta_style),
+                    Paragraph(f"<b>Email:</b> {_pdf_text(employee.get('email'))}", meta_style),
+                    Paragraph(f"<b>Department:</b> {_pdf_text(employee.get('department'))}", meta_style),
+                    Paragraph(f"<b>Role:</b> {_pdf_text(employee.get('role'))}", meta_style),
+                    Paragraph(f"<b>Month:</b> {_pdf_text(month_label(report.get('month')))}", meta_style),
                 ],
             ]
         ],
-        colWidths=[34 * mm, 96 * mm],
+        colWidths=[30 * mm, 93 * mm],
     )
     employee_info_table.setStyle(
         TableStyle(
             [
-                ("BACKGROUND", (0, 0), (-1, -1), colors.HexColor("#f8fafc")),
-                ("BOX", (0, 0), (-1, -1), 0.6, colors.HexColor("#cbd5e1")),
+                ("BACKGROUND", (0, 0), (-1, -1), colors.HexColor("#f8fbff")),
+                ("BOX", (0, 0), (-1, -1), 0.6, colors.HexColor("#bfdbfe")),
+                ("LINEBEFORE", (0, 0), (0, -1), 2.2, colors.HexColor("#2563eb")),
                 ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
                 ("LEFTPADDING", (0, 0), (-1, -1), 8),
                 ("RIGHTPADDING", (0, 0), (-1, -1), 8),
@@ -4635,20 +4750,25 @@ def _monthly_report_pdf_bytes(report: dict) -> bytes:
             ]
         )
     )
-    header_table = Table([[title_block, employee_info_table]], colWidths=[118 * mm, 130 * mm])
+    header_table = Table([[title_block, employee_info_table]], colWidths=[48 * mm, 125 * mm])
     header_table.setStyle(
         TableStyle(
             [
+                ("BACKGROUND", (0, 0), (0, 0), colors.HexColor("#eff6ff")),
+                ("LINEBEFORE", (0, 0), (0, 0), 2.5, colors.HexColor("#2563eb")),
                 ("VALIGN", (0, 0), (-1, -1), "TOP"),
-                ("LEFTPADDING", (0, 0), (-1, -1), 0),
+                ("LEFTPADDING", (0, 0), (0, 0), 7),
+                ("LEFTPADDING", (1, 0), (1, 0), 0),
                 ("RIGHTPADDING", (0, 0), (-1, -1), 0),
-                ("TOPPADDING", (0, 0), (-1, -1), 0),
-                ("BOTTOMPADDING", (0, 0), (-1, -1), 0),
+                ("TOPPADDING", (0, 0), (0, 0), 7),
+                ("BOTTOMPADDING", (0, 0), (0, 0), 7),
+                ("TOPPADDING", (1, 0), (1, 0), 0),
+                ("BOTTOMPADDING", (1, 0), (1, 0), 0),
             ]
         )
     )
 
-    elements: list[object] = [header_table, Spacer(1, 5 * mm)]
+    elements: list[object] = [header_table, Spacer(1, 4 * mm)]
 
     summary_table = Table(
         [
@@ -4660,72 +4780,92 @@ def _monthly_report_pdf_bytes(report: dict) -> bytes:
                 [Paragraph("Total Fine (PKR)", summary_label_style), Paragraph(f"{float(summary['total_fine']):.2f}", summary_value_style)],
             ],
         ],
-        colWidths=[48 * mm, 40 * mm, 40 * mm, 40 * mm, 58 * mm],
+        colWidths=[31 * mm, 31 * mm, 31 * mm, 31 * mm, 49 * mm],
     )
     summary_table.setStyle(
         TableStyle(
             [
-                ("BACKGROUND", (0, 0), (-1, -1), colors.HexColor("#f8fafc")),
+                ("BACKGROUND", (0, 0), (-1, -1), colors.HexColor("#ffffff")),
                 ("BOX", (0, 0), (-1, -1), 0.5, colors.HexColor("#cbd5e1")),
                 ("INNERGRID", (0, 0), (-1, -1), 0.5, colors.HexColor("#e2e8f0")),
                 ("ALIGN", (0, 0), (-1, -1), "CENTER"),
                 ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
-                ("BOTTOMPADDING", (0, 0), (-1, -1), 7),
-                ("TOPPADDING", (0, 0), (-1, -1), 7),
+                ("BOTTOMPADDING", (0, 0), (-1, -1), 5),
+                ("TOPPADDING", (0, 0), (-1, -1), 5),
+                ("LINEABOVE", (0, 0), (0, 0), 2.2, colors.HexColor("#16a34a")),
+                ("LINEABOVE", (1, 0), (1, 0), 2.2, colors.HexColor("#d97706")),
+                ("LINEABOVE", (2, 0), (2, 0), 2.2, colors.HexColor("#dc2626")),
+                ("LINEABOVE", (3, 0), (3, 0), 2.2, colors.HexColor("#2563eb")),
+                ("LINEABOVE", (4, 0), (4, 0), 2.2, colors.HexColor("#7c3aed")),
             ]
         )
     )
-    elements.extend([summary_table, Spacer(1, 5 * mm), Paragraph("DATE-WISE BREAKDOWN", section_label_style), Spacer(1, 2 * mm)])
+    elements.extend([summary_table, Spacer(1, 4 * mm), Paragraph("<b>DATE-WISE ATTENDANCE</b>", section_label_style), Spacer(1, 1.5 * mm)])
 
     day_rows: list[list[object]] = [[
-        Paragraph("<b>Date</b>", compact_style),
-        Paragraph("<b>Day</b>", compact_style),
-        Paragraph("<b>Status</b>", compact_style),
-        Paragraph("<b>Check-in</b>", compact_style),
-        Paragraph("<b>Late</b>", compact_style),
-        Paragraph("<b>Fine</b>", compact_style),
-        Paragraph("<b>Source</b>", compact_style),
-        Paragraph("<b>Evidence</b>", compact_style),
-        Paragraph("<b>Note</b>", compact_style),
+        Paragraph("<b>Date</b>", header_cell_style),
+        Paragraph("<b>Status</b>", header_cell_style),
+        Paragraph("<b>Timing</b>", header_cell_style),
+        Paragraph("<b>Fine</b>", header_cell_style),
+        Paragraph("<b>Source / Note</b>", header_cell_style),
+        Paragraph("<b>Proof</b>", header_cell_style),
     ]]
 
     for day in days:
-        evidence = _pdf_image_or_placeholder(day.get("evidence_photo_url"), 16, 16, compact_style)
+        evidence = _pdf_image_or_placeholder(day.get("evidence_photo_url"), 15, 15, muted_center_style, "No proof")
+        note = str(day.get("note") or "").strip()
+        source_lines = [
+            Paragraph(f"<b>{_pdf_text(day.get('source'))}</b>", compact_style),
+        ]
+        if note:
+            source_lines.append(Paragraph(_pdf_text(note), compact_style))
         day_rows.append(
             [
-                Paragraph(str(day["date"]), compact_style),
-                Paragraph(str(day["weekday"]), compact_style),
-                Paragraph(str(day["status"]), compact_style),
-                Paragraph(str(day.get("checkin_time") or "-"), compact_style),
-                Paragraph(str(int(day.get("late_minutes") or 0)), compact_style),
-                Paragraph(f"{float(day.get('fine_amount') or 0):.2f}", compact_style),
-                Paragraph(str(day.get("source") or "-"), compact_style),
+                [
+                    Paragraph(f"<b>{_pdf_text(day_label(day.get('date'), day.get('weekday')))}</b>", small_style),
+                    Paragraph(_pdf_text(day.get("date")), compact_style),
+                ],
+                status_badge(day.get("status")),
+                [
+                    Paragraph(f"<b>Check-in:</b> {_pdf_text(day.get('checkin_time'))}", compact_style),
+                    Paragraph(f"<b>Late:</b> {int(day.get('late_minutes') or 0)} min", compact_style),
+                ],
+                Paragraph(f"<b>PKR {float(day.get('fine_amount') or 0):.2f}</b>", compact_style),
+                source_lines,
                 evidence,
-                Paragraph(str(day.get("note") or "-"), compact_style),
             ]
         )
 
     detail_table = Table(
         day_rows,
         repeatRows=1,
-        colWidths=[22 * mm, 13 * mm, 20 * mm, 20 * mm, 12 * mm, 15 * mm, 18 * mm, 20 * mm, 78 * mm],
+        colWidths=[34 * mm, 24 * mm, 37 * mm, 24 * mm, 35 * mm, 19 * mm],
     )
-    detail_table.setStyle(
-        TableStyle(
-            [
-                ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#0f172a")),
-                ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
-                ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
-                ("GRID", (0, 0), (-1, -1), 0.35, colors.HexColor("#cbd5e1")),
-                ("VALIGN", (0, 0), (-1, -1), "TOP"),
-                ("ROWBACKGROUNDS", (0, 1), (-1, -1), [colors.white, colors.HexColor("#f8fafc")]),
-                ("TOPPADDING", (0, 0), (-1, -1), 4),
-                ("BOTTOMPADDING", (0, 0), (-1, -1), 4),
-                ("ALIGN", (3, 1), (7, -1), "CENTER"),
-            ]
-        )
+    detail_style = TableStyle(
+        [
+            ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#2563eb")),
+            ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
+            ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
+            ("BOX", (0, 0), (-1, -1), 0.45, colors.HexColor("#bfdbfe")),
+            ("INNERGRID", (0, 0), (-1, -1), 0.35, colors.HexColor("#dbeafe")),
+            ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+            ("TOPPADDING", (0, 0), (-1, 0), 4),
+            ("BOTTOMPADDING", (0, 0), (-1, 0), 4),
+            ("TOPPADDING", (0, 1), (-1, -1), 4),
+            ("BOTTOMPADDING", (0, 1), (-1, -1), 4),
+            ("LEFTPADDING", (0, 0), (-1, -1), 5),
+            ("RIGHTPADDING", (0, 0), (-1, -1), 5),
+            ("ALIGN", (1, 1), (3, -1), "CENTER"),
+            ("ALIGN", (5, 1), (5, -1), "CENTER"),
+        ]
     )
-    elements.extend([detail_table, Spacer(1, 5 * mm), Paragraph(f"Generated on {generated_at}", footer_style)])
+    for row_index, day in enumerate(days, start=1):
+        status_color, row_background = status_palette(day.get("status"))
+        detail_style.add("BACKGROUND", (0, row_index), (-1, row_index), row_background)
+        detail_style.add("LINEBEFORE", (0, row_index), (0, row_index), 2.2, status_color)
+        detail_style.add("LINEABOVE", (0, row_index), (-1, row_index), 1.1, colors.white)
+    detail_table.setStyle(detail_style)
+    elements.extend([detail_table, Spacer(1, 3 * mm), Paragraph(f"Generated on {generated_at}", footer_style)])
 
     doc.build(elements)
     return buffer.getvalue()
